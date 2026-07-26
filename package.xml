@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>localization_pf</name>
+  <version>0.1.0</version>
+  <description>Particle-filter LiDAR-IMU-wheel localization with relative principal-axis global relocalization</description>
+  <maintainer email="tlswotj4636@naver.com">shin</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>vesc_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!--exec_depend>slam_range_libc</exec_depend-->
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

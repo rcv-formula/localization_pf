@@ -1,0 +1,240 @@
+# slam_ours 파라미터 — 값 전용.
+# 처리 파이프라인 분기(경로 선택 플래그)는 코드에 고정되어 있어 여기 없습니다.
+# 섹션은 노테이션 파트 구조(IO / ① Particle filter / ② Relocalization)를 따릅니다.
+slam_ours:
+  ros__parameters:
+    use_sim_time: false
+
+    # ==================================================================
+    # IO — 토픽 · 프레임 · 출력
+    # ==================================================================
+    scan_topic: /scan
+    imu_topic: /imu
+    map_topic: /map
+    vesc_state_topic: /sensors/core
+
+    frames:
+      map: map
+      odom: odom
+      base: base_link
+      laser: laser
+
+    output:
+      # 포즈/TF 출력 주기. PF(스캔 40Hz)와 독립적으로 궤적 버퍼를 읽어 냅니다.
+      rate_hz: 100.0
+      publish_particles: true
+      # base_link->laser 정적 TF 발행 on/off. tf_static이 비어 있는
+      # bag(icra 등)은 true여야 laser 프레임이 생기고, 상위/드라이버가
+      # 이미 base_link->laser를 발행하면 false로 두어 중복을 막습니다.
+      publish_laser_tf: true
+
+    # ==================================================================
+    # ① PARTICLE FILTER — scan 트리거 pose correction (~40 Hz)
+    # ==================================================================
+
+    # --- wheel + IMU EKF (odometry) ---
+    ekf:
+      # 휠 카운트->미터 보정 배율. 현재 데이터셋들은 인코더 계수가 2.6배
+      # 작게 기록되어 있어(스캔-앵커 검증 2.48~2.71) 2.6이 맞고, 새
+      # 플랫폼(계수 정상)에서는 1.0으로.
+      wheel_scale: 2.6
+      velocity_deadzone: 0.03
+      max_wheel_speed: 30.0
+      # 궤적 링버퍼/센서 히스토리 보관 시간(PF가 직전 스캔 시각을 되돌아볼
+      # 만큼 넉넉해야 함).
+      history_keep_time: 1.0
+      max_imu_extrapolation: 0.02
+      max_wheel_extrapolation: 0.03
+      wheel_velocity_variance: 0.0009
+      lateral_accel_variance: 0.1225
+      slip_gain: 20.0
+      enable_startup_gravity_calibration: true
+      gravity_calibration_path: ""
+      process_position_std: 0.02
+      process_yaw_std: 0.01
+      process_velocity_std: 0.20
+
+    # --- 센서 장착 위치(뒤차축 기준). laser는 TF 조회값이 우선, 아래는 fallback ---
+    extrinsic:
+      rear_to_imu_x: 0.25
+      rear_to_imu_y: 0.0
+      rear_to_imu_z: 0.0
+      rear_to_laser_x: 0.25
+      rear_to_laser_y: 0.0
+
+    # --- deskew (motion distortion 보정) ---
+    deskew:
+      # scan.time_increment가 0으로 오는 센서용 대체 스윕 길이[s].
+      fallback_sweep_duration: 0.025
+      max_lookup_failure_ratio: 0.2
+
+    # --- 예측 노이즈 (이동량 비례, 정지 중 0 수렴) ---
+    motion_noise:
+      trans_per_trans: 0.15
+      lateral_per_trans: 0.05
+      rot_per_rot: 0.15
+      rot_per_trans: 0.03
+      # 기하 퇴화 방향으로 노이즈를 최대 (1 + 이 값)배까지 더 펼칩니다.
+      degeneracy_gain: 2.0
+      # 스캔 정합도가 무너질수록(best가 score_good->score_fail_threshold로)
+      # 노이즈를 최대 (1+이 값)배 등방 확대해 재포착을 돕습니다.
+      recovery_gain: 3.0
+      # 사이클당 노이즈 바닥 — 저속에서도 최소 국소 탐색 유지.
+      min_trans_sigma: 0.01
+      min_yaw_sigma_deg: 0.3
+
+    # --- 파티클 집합 · 리샘플 · 무상태 스캔 풀 ---
+    filter:
+      particle_count: 1000
+      # 빔당 평균 log-likelihood를 가중으로 바꿀 때의 온도(유효 독립 빔 수
+      # 관점에서 20~50이 정상, 여기선 10).
+      likelihood_scale: 10.0
+      # 호흡(퍼짐-수축) 진폭 완충을 위해 0.5 대신 0.35.
+      resample_neff_ratio: 0.35
+      init_position_std: 0.10
+      init_yaw_std: 0.05
+      # 정지 중 다양성 고갈을 막기 위한 최소 이동/회전량.
+      resample_min_translation: 0.02
+      resample_min_rotation: 0.01
+      # 무상태 스캔 풀: 매 프레임 "이전 최종 pose + 이번 이동량" 지점 주위
+      # 고정 범위에 100개 균일 샘플을 스캔 score로 채점, best보다 margin
+      # 이상 좋으면 본 필터 최하위 inject_count개 교체. RViz:
+      # /slam_ours/scan_particles.
+      scan_particle_count: 100
+      scan_particle_spread_pos: 0.5
+      scan_particle_spread_yaw_deg: 15.0
+      scan_particle_inject_margin: 0.5
+      scan_particle_inject_count: 20
+
+    # --- likelihood field scan scoring + beam skipping ---
+    scoring:
+      # likelihood field 넓은 성분 sigma[m] (적용 반경 = 3x이 값 = 0.6m).
+      factor: 0.2
+      # 벽 근처 봉우리용 좁은 성분: K = w*N(sharp) + (1-w)*N(factor).
+      # 벽에 가까울수록 점수가 급격히 오르고 유역(0.6m)은 유지됩니다.
+      sharp_sigma: 0.05
+      sharp_weight: 0.8
+      # 채점 빔 솎음(1=전체). AMCL 관행(60빔) 대비 2~4는 보수적.
+      beam_stride: 2
+      # 채점 스레드 수(0=auto, 실차 기기 대비 4로 상한).
+      threads: 4
+      # 이 확률 미만 셀에 떨어진 빔 = 아웃라이어(벽에서 ~2시그마 밖).
+      # 주의: 커널(sharp_*)을 바꾸면 이 값과 beam_skip_prob의 물리 거리
+      # 경계가 함께 바뀌므로 재보정 필요.
+      outlier_prob: 0.02
+      # beam skipping: 파티클 서브샘플 합의율이 consensus 미만인 빔 =
+      # 동적/미지도 물체로 채점 제외. 제안 스킵 비율이 error_threshold를
+      # 넘으면 미아 가능성이므로 스킵 포기(전체 빔 사용).
+      beam_skip_prob: 0.01
+      beam_skip_consensus: 0.3
+      beam_skip_error_threshold: 0.5
+      beam_skip_particle_stride: 8
+
+    # --- adaptive geometrical weight: 맵 기반 관측성 사전계산 (로드 시 1회) ---
+    # 격자점은 free 셀, raycast는 unknown 통과, 사거리는 실효 반사거리.
+    observability:
+      grid_step_m: 0.30
+      heading_bins: 32
+      clearance_m: 0.15
+      max_range_m: 5.0
+      # sigma(v) = slip_tolerance / sqrt(lambda(v)) [m]
+      slip_tolerance_m: 0.10
+      max_sigma_m: 10.0
+      # 법선 방향이 이 각도 이내인 선분은 같은 방향 반복 측정으로 군집화.
+      direction_cluster_deg: 5.0
+      # confidence = ref^2 / (ref^2 + sigma^2), sigma=ref에서 0.5.
+      reference_sigma_m: 1.0
+      # 조회 실패(커버리지 밖) 시 등방 중립 신뢰도(fail-open).
+      fallback_confidence: 0.5
+
+    # --- 관측성 기반 방향별 융합 (scan <-> wheel) ---
+    estimation:
+      # alpha(v) = scan_trust * confidence(v). [0,1] 감쇠 노브라 아무리
+      # 키워도 퇴화 방향 보호를 무력화할 수 없습니다.
+      scan_trust: 1.0
+      # yaw는 아직 관측성 지표가 없어 상수 가중.
+      yaw_scan_trust: 1.0
+      odom_position_growth: 0.10
+      odom_yaw_growth: 0.05
+      odom_yaw_growth_per_meter: 0.02
+
+    # --- 다중 가설 수렴 판정 + 실패 감지(빔 합의 / off-map) ---
+    tracking:
+      # 지배 모드 질량이 converge_mass 이상인 채로 이 거리+회전만큼 주행해야
+      # Tracking 확정. 정지 중에는 앨리어스 구분이 불가능해 절대 수렴 안 함.
+      converge_mass: 0.9
+      converge_distance_m: 1.0
+      # 직선 1m로는 복도 앨리어스 판별 불가 — 코너 통과(누적 회전) 요구.
+      converge_rotation_deg: 90.0
+      # 노이즈 회복 건강도 스케일 하한(트리거 아님 — Lost 트리거는 빔 합의와
+      # off-map 둘뿐).
+      score_fail_threshold: -9.0
+      score_good: -1.0
+      # 빔 합의 실패 감지: 스킵 제안 비율 > lost_fraction 인 프레임이 창 N 중
+      # M개 이상이면 위치 상실로 보고 relocalization.
+      beamskip_lost_fraction: 0.25
+      beamskip_lost_window: 10
+      beamskip_lost_count: 4
+      # off-map 감지: fused가 free 아닌 셀에 머무는 비율(EMA, 시간상수
+      # window)이 임계를 넘으면 배치 오류로 보고 Lost(닮은꼴 루프 앨리어스).
+      map_consistency_window_s: 5.0
+      map_consistency_threshold: 0.3
+      # 빔 아웃라이어 '비율' 기반 즉각 노이즈: good 이하면 확장 없음, bad에서
+      # 최대 확장(recovery_gain 배).
+      outlier_frac_good: 0.15
+      outlier_frac_bad: 0.5
+
+    # ==================================================================
+    # ② RELOCALIZATION — 실패 감지 시 global localization (~1 Hz)
+    # ==================================================================
+    relocalization:
+      # --- 후보 격자/레이캐스트 ---
+      occupied_threshold: 65
+      ray_count: 720
+      raycast_batch_size: 512
+      minimum_scan_points: 10
+      max_range: 30.0
+      fov_deg: 270.0
+      # --- 상대주축 인덱스 (PCA heading pruning) ---
+      # A(psi)가 이 각[도] 안이면 하나의 run으로 압축(사전계산 크기 결정).
+      axis_run_tolerance_deg: 3.0
+      # 스캔 축과 run 상대주축의 허용 각오차[도] = 후보 pruning 강도.
+      axis_match_tolerance_deg: 1.0
+      # 역산 heading 주변으로 추가 평가할 ray 칸 수(+-). 1칸=0.5도.
+      yaw_refine_bins: 2
+      max_heading_hypotheses: 180
+      # --- 관측성(queryStaticGeometry) 법선 추정 ---
+      normal_chord_m: 0.30
+      normal_max_half_window: 20
+      normal_residual_limit_m: 0.06
+      observability_reference: 40.0
+      # --- 위치 coarse-to-fine 탐색 ---
+      coarse_position_step_m: 0.30
+      fine_position_radius_m: 0.30
+      top_candidates: 24
+      # Lost 상태에서 전역 탐색(수백 ms) 재시도 최소 간격.
+      retry_period_s: 1.0
+      # --- 다중 가설 + 검증 게이트 ---
+      # 복도 앨리어싱 대응: 단일 확정 대신 상위 가설을 PF에 넘겨 주행으로 판별.
+      max_hypotheses: 5
+      # best(음수) 점수의 이 배율 안까지만 가설로 인정.
+      hypothesis_score_ratio: 3.0
+      # 이 거리/각도보다 가까우면 같은 가설로 흡수(180도 플립은 각도로 생존).
+      hypothesis_min_separation_m: 0.8
+      hypothesis_min_separation_deg: 25.0
+      # 검증 게이트: 예측 프로파일 인라이어(|오차|<inlier_m) 비율 미달 후보
+      # 탈락 — 검증 통과 후보만 파티클 시드(0=끔).
+      hypothesis_verify_fraction: 0.7
+      hypothesis_verify_inlier_m: 0.2
+      # --- multi-scan 공동 채점 ---
+      # 과거 스캔을 DR 상대이동으로 묶어 공동 채점(복도/루프 앨리어스 제거).
+      multi_scan_count: 12
+      multi_scan_spacing_m: 0.5
+      multi_scan_spacing_deg: 15.0
+      multi_scan_top_candidates: 64
+      # --- 궤적-모양 전역 정합 ---
+      # 코너 포함 누적 궤적이 (거리, 회전) 조건을 넘으면 DR 궤적을 free
+      # 공간에 전역 정합(낡은 맵/자기유사 트랙 대책).
+      trajectory_fit_min_distance_m: 8.0
+      trajectory_fit_min_rotation_deg: 180.0
+      trajectory_fit_history_m: 30.0
