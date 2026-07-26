@@ -27,26 +27,48 @@ only through a shared trajectory buffer and the `map → odom` transform:
 
 - **ROS 2** (rclcpp, geometry_msgs, nav_msgs, sensor_msgs, std_msgs, tf2,
   tf2_geometry_msgs, tf2_ros, visualization_msgs)
-- [`vesc_msgs`](https://github.com/f1tenth/vesc) — VESC state message package,
-  place in your ROS 2 workspace `src/`.
 - **Eigen3**
-- [`range_libc`](https://github.com/kctess5/range_libc) — bundled as a git
+- [`range_libc`](https://github.com/kctess5/range_libc) — vendored as a git
   submodule under `third_party/range_libc` (header + lodepng only; CUDA/Vulkan
   paths are disabled).
+- **`vesc_msgs`** — the VESC message package used by the platform, pulled from
+  [`rcv-formula/f1_stack_for_damvi`](https://github.com/rcv-formula/f1_stack_for_damvi)
+  (`vesc/vesc_msgs`). The node subscribes to `vesc_msgs/VescStateStamped` and
+  reads `state.displacement` (wheel tachometer).
+
+`scripts/setup.sh` fetches both automatically — see below.
 
 ## Build
 
+Clone into a ROS 2 workspace `src/`, then run the setup script — it initializes
+the `range_libc` submodule, fetches `vesc_msgs` from `f1_stack_for_damvi`, and
+builds:
+
 ```bash
-# clone into a ROS 2 workspace, with submodules
+cd <ros2_ws>/src
+git clone https://github.com/rcv-formula/localization_pf.git
+cd localization_pf
+./scripts/setup.sh                 # deps + build   (--no-build to only fetch deps)
+```
+
+Or do it by hand:
+
+```bash
 cd <ros2_ws>/src
 git clone --recurse-submodules https://github.com/rcv-formula/localization_pf.git
-# (if you cloned without --recurse-submodules)
-cd localization_pf && git submodule update --init --recursive && cd ..
-
-# make sure vesc_msgs is also present in src/, then build from the ws root
+# vesc_msgs (only the message package) next to it in src/
+git clone --depth 1 --filter=blob:none --sparse \
+    https://github.com/rcv-formula/f1_stack_for_damvi.git /tmp/f1stack
+git -C /tmp/f1stack sparse-checkout set vesc/vesc_msgs
+cp -r /tmp/f1stack/vesc/vesc_msgs ./vesc_msgs
 cd <ros2_ws>
-colcon build --packages-select localization_pf --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon build --packages-select vesc_msgs localization_pf \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
+
+> If your workspace already contains `vesc_msgs`, `setup.sh` keeps the existing
+> one. The node only needs `VescStateStamped` with an integer `state.displacement`
+> tachometer field; set the source topic via `vesc_state_topic` in the config.
 
 ## Run
 
