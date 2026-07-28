@@ -80,6 +80,29 @@ ros2 launch localization_pf localization_pf.launch.py params_file:=/path/to/conf
 (IO / 파티클 필터 / relocalization)로 정리되어 있습니다. 처리 파이프라인 분기는
 코드에 고정되어 있어 config는 값만 담습니다.
 
+> **config 라이브 반영** — launch는 워크스페이스의 소스 `config/config.yaml`을
+> 직접 읽습니다. 따라서 값을 수정한 뒤 **`colcon build` 없이 재런치만** 하면
+> 바로 반영됩니다(설치본이 아니라 소스를 읽음; 소스 트리가 없는 배포 설치에서는
+> 설치된 config로 폴백).
+
+## 지도(map)
+
+노드는 자체 맵 로더를 내장하고 있어 별도 `map_server` 없이 동작합니다. 켜져 있으면
+(`map_loader.enabled: true`, 기본값):
+
+1. 패키지의 [`map/`](map) 폴더에서 `map_loader.map_name`(기본 `map`)에 해당하는
+   `<map_name>.yaml` + 이미지(PGM)를 읽어
+2. 로컬라이제이션에 직접 사용하고(내부 보유),
+3. `map_topic`(기본 `/map`)에 **transient_local**로 latch 발행합니다 — RViz나
+   상위 노드가 늦게 붙어도 지도를 받습니다.
+
+`map/` 폴더에 표준 `map_server` 형식의 `map.yaml`(+`map.pgm`)이 샘플로 들어 있습니다.
+실제 지도로 교체하고 `map_loader.map_name`만 맞추면 됩니다. launch가 `map_dir`을
+소스 `map/` 폴더로 주입하므로 지도 교체도 재런치만으로 반영됩니다.
+
+외부 `map_server`를 쓰려면 `map_loader.enabled: false`로 두면 `map_topic`을
+구독합니다.
+
 ## 인터페이스
 
 **구독 (Subscriptions)**

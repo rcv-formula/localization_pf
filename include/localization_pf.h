@@ -60,6 +60,12 @@ private:
   void declareParameters();
 
   void map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+  // 맵으로 relocalization/scoring/observability를 (재)구성하고 추적 상태를
+  // 리셋합니다. 외부 /map 구독과 자체 파일 로더가 공유하는 경로입니다.
+  bool setupMap(const nav_msgs::msg::OccupancyGrid &grid);
+  // 패키지 map 폴더의 <map_name>.yaml + 이미지를 OccupancyGrid로 읽어
+  // setupMap을 호출하고, transient_local로 map_topic에 latch 발행합니다.
+  bool loadMapFromFile(const std::string &map_dir, const std::string &map_name);
   void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void vesc_state_callback(const vesc_msgs::msg::VescStateStamped::SharedPtr msg);
@@ -105,6 +111,11 @@ private:
   std::string scan_topic_{"/scan"};
   std::string imu_topic_{"/imu"};
   std::string map_topic_{"/map"};
+  // 자체 맵 로더: 켜면 map_dir/<map_name>.yaml+이미지를 읽어 localization에
+  // 쓰고 map_topic에 latch 발행합니다. 끄면 외부 /map을 구독합니다.
+  bool map_loader_enabled_{true};
+  std::string map_loader_dir_{};
+  std::string map_loader_name_{"map"};
   std::string map_frame_{"map"};
   std::string odom_frame_{"odom"};
   std::string base_frame_{"base_link"};
@@ -274,6 +285,7 @@ private:
 
   // ---- ROS 입출력 ----
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
+  rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr map_pub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;

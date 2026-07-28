@@ -19,6 +19,16 @@ slam_ours:
       base: base_link
       laser: laser
 
+    # 자체 맵 로더 — 켜면 map_dir/<map_name>.yaml(+이미지)을 읽어 로컬라이제이션에
+    # 쓰고, map_topic에 transient_local로 latch 발행합니다(RViz/상위가 늦게 붙어도
+    # 수신). 끄면 외부 map_server의 map_topic을 구독합니다.
+    map_loader:
+      enabled: true
+      # 로드할 맵 이름(확장자 제외). map_dir/<map_name>.yaml 을 읽습니다.
+      map_name: map
+      # 맵 폴더. 비우면 launch가 패키지의 map/ 폴더로 채워 줍니다.
+      map_dir: ""
+
     output:
       # 포즈/TF 출력 주기. PF(스캔 40Hz)와 독립적으로 궤적 버퍼를 읽어 냅니다.
       rate_hz: 100.0

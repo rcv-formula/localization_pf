@@ -7,9 +7,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -103,9 +106,26 @@ mainNode::mainNode()
   publishState();
 
   // ROS 입출력은 노드가 소유하고 각 구성 요소에는 메시지만 전달합니다.
-  map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-    map_topic_, rclcpp::QoS(1).transient_local(),
-    std::bind(&mainNode::map_callback, this, std::placeholders::_1));
+  // 자체 맵 로더가 켜져 있으면 파일에서 맵을 읽어 쓰고 latch 발행합니다.
+  // 꺼져 있으면 외부 map_server의 map_topic을 구독합니다.
+  if (map_loader_enabled_) {
+    map_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>(
+      map_topic_, rclcpp::QoS(1).transient_local());
+    if (!loadMapFromFile(map_loader_dir_, map_loader_name_)) {
+      RCLCPP_ERROR(
+        this->get_logger(),
+        "map loader enabled but failed to load '%s' from '%s' — "
+        "falling back to subscribing %s.",
+        map_loader_name_.c_str(), map_loader_dir_.c_str(), map_topic_.c_str());
+      map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+        map_topic_, rclcpp::QoS(1).transient_local(),
+        std::bind(&mainNode::map_callback, this, std::placeholders::_1));
+    }
+  } else {
+    map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
+      map_topic_, rclcpp::QoS(1).transient_local(),
+      std::bind(&mainNode::map_callback, this, std::placeholders::_1));
+  }
 
   // 센서 입력은 best-effort로 받습니다. reliable 구독자는 best-effort 퍼블리셔의
   // 메시지를 아예 받지 못하지만(QoS 비호환), best-effort 구독자는 reliable
@@ -138,6 +158,10 @@ void mainNode::declareParameters() {
   scan_topic_ = this->declare_parameter<std::string>("scan_topic", "/scan");
   imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu");
   map_topic_ = this->declare_parameter<std::string>("map_topic", "/map");
+  // 자체 맵 로더. map_dir는 보통 launch가 패키지 map 폴더로 주입합니다.
+  map_loader_enabled_ = this->declare_parameter<bool>("map_loader.enabled", true);
+  map_loader_dir_ = this->declare_parameter<std::string>("map_loader.map_dir", "");
+  map_loader_name_ = this->declare_parameter<std::string>("map_loader.map_name", "map");
   map_frame_ = this->declare_parameter<std::string>("frames.map", "map");
   odom_frame_ = this->declare_parameter<std::string>("frames.odom", "odom");
   base_frame_ = this->declare_parameter<std::string>("frames.base", "base_link");
@@ -412,8 +436,11 @@ void mainNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
   {
     return;
   }
+  setupMap(*msg);
+}
 
-  map_ = *msg;
+bool mainNode::setupMap(const nav_msgs::msg::OccupancyGrid &grid) {
+  map_ = grid;
 
   try {
     // 첫 맵에서는 객체를 만들고, 이후 맵 갱신은 같은 객체를 다시 계산합니다.
@@ -454,7 +481,7 @@ void mainNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
     }
   } catch (const std::exception &error) {
     RCLCPP_ERROR(this->get_logger(), "Failed to prepare map: %s", error.what());
-    return;
+    return false;
   }
 
   // 맵이 바뀌면 이전 추정은 더 이상 유효하지 않습니다.
@@ -464,6 +491,146 @@ void mainNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
   map_to_odom_valid_ = false;
   setState(LocalizationState::Lost);
   RCLCPP_INFO(this->get_logger(), "Map ready. Waiting for global localization.");
+  return true;
+}
+
+namespace {
+
+// map.yaml의 flat key: value를 파싱합니다(yaml-cpp 의존 없이). origin은
+// [x, y, yaw] 리스트로 읽습니다. 주석(#)과 따옴표는 제거합니다.
+struct MapMeta {
+  std::string image;
+  double resolution{0.05};
+  double origin_x{0.0};
+  double origin_y{0.0};
+  double origin_yaw{0.0};
+  int negate{0};
+  double occupied_thresh{0.65};
+  double free_thresh{0.196};
+};
+
+std::string trimToken(std::string s) {
+  auto notspace = [](int c) { return !std::isspace(c) && c != '"' && c != '\''; };
+  while (!s.empty() && !notspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+  while (!s.empty() && !notspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+  return s;
+}
+
+bool parseMapYaml(const std::string &path, MapMeta &out) {
+  std::ifstream file(path);
+  if (!file) return false;
+  std::string line;
+  while (std::getline(file, line)) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) line = line.substr(0, hash);
+    const auto colon = line.find(':');
+    if (colon == std::string::npos) continue;
+    const std::string key = trimToken(line.substr(0, colon));
+    std::string value = line.substr(colon + 1);
+    if (key == "image") {
+      out.image = trimToken(value);
+    } else if (key == "resolution") {
+      out.resolution = std::atof(trimToken(value).c_str());
+    } else if (key == "negate") {
+      out.negate = std::atoi(trimToken(value).c_str());
+    } else if (key == "occupied_thresh") {
+      out.occupied_thresh = std::atof(trimToken(value).c_str());
+    } else if (key == "free_thresh") {
+      out.free_thresh = std::atof(trimToken(value).c_str());
+    } else if (key == "origin") {
+      // [x, y, yaw]
+      for (char &c : value) if (c == '[' || c == ']' || c == ',') c = ' ';
+      std::istringstream ss(value);
+      ss >> out.origin_x >> out.origin_y >> out.origin_yaw;
+    }
+  }
+  return !out.image.empty();
+}
+
+// P5(binary) PGM을 읽습니다. 주석 허용, maxval<256 가정.
+bool loadPgm(const std::string &path, int &width, int &height,
+             std::vector<uint8_t> &pixels) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file) return false;
+  std::string magic;
+  file >> magic;
+  if (magic != "P5") return false;
+  auto read_int = [&](int &value) {
+    int c = file.get();
+    while (true) {
+      while (std::isspace(c)) c = file.get();
+      if (c == '#') { while (c != '\n' && c != EOF) c = file.get(); }
+      else break;
+    }
+    value = 0;
+    while (std::isdigit(c)) { value = value * 10 + (c - '0'); c = file.get(); }
+  };
+  int maxval = 0;
+  read_int(width); read_int(height); read_int(maxval);
+  if (width <= 0 || height <= 0 || maxval <= 0 || maxval > 255) return false;
+  pixels.resize(static_cast<std::size_t>(width) * height);
+  file.read(reinterpret_cast<char *>(pixels.data()), pixels.size());
+  return static_cast<std::size_t>(file.gcount()) == pixels.size();
+}
+
+}  // namespace
+
+bool mainNode::loadMapFromFile(const std::string &map_dir,
+                               const std::string &map_name) {
+  const std::string yaml_path = map_dir + "/" + map_name + ".yaml";
+  MapMeta meta;
+  if (!parseMapYaml(yaml_path, meta)) {
+    RCLCPP_ERROR(this->get_logger(), "map loader: cannot read %s", yaml_path.c_str());
+    return false;
+  }
+  // 이미지 경로는 yaml 기준 상대이면 map_dir을 붙입니다.
+  std::string image_path = meta.image;
+  if (!image_path.empty() && image_path.front() != '/') {
+    image_path = map_dir + "/" + image_path;
+  }
+  int width = 0, height = 0;
+  std::vector<uint8_t> pixels;
+  if (!loadPgm(image_path, width, height, pixels)) {
+    RCLCPP_ERROR(this->get_logger(), "map loader: cannot read PGM %s (P5 only)",
+                 image_path.c_str());
+    return false;
+  }
+
+  // OccupancyGrid 구성(map_server 규약): 상단 행이 PGM row0이므로 상하 반전.
+  nav_msgs::msg::OccupancyGrid grid;
+  grid.header.frame_id = map_frame_;
+  grid.header.stamp = this->now();
+  grid.info.resolution = meta.resolution;
+  grid.info.width = static_cast<uint32_t>(width);
+  grid.info.height = static_cast<uint32_t>(height);
+  grid.info.origin.position.x = meta.origin_x;
+  grid.info.origin.position.y = meta.origin_y;
+  grid.info.origin.orientation.z = std::sin(meta.origin_yaw * 0.5);
+  grid.info.origin.orientation.w = std::cos(meta.origin_yaw * 0.5);
+  grid.data.resize(static_cast<std::size_t>(width) * height);
+  for (int my = 0; my < height; ++my) {
+    for (int mx = 0; mx < width; ++mx) {
+      const uint8_t p = pixels[static_cast<std::size_t>(height - 1 - my) * width + mx];
+      const double occ = meta.negate ? (p / 255.0) : ((255 - p) / 255.0);
+      int8_t cell;
+      if (occ > meta.occupied_thresh) cell = 100;
+      else if (occ < meta.free_thresh) cell = 0;
+      else cell = -1;
+      grid.data[static_cast<std::size_t>(my) * width + mx] = cell;
+    }
+  }
+
+  RCLCPP_INFO(this->get_logger(),
+    "map loader: %s (%dx%d, res %.3f, origin %.2f,%.2f)",
+    map_name.c_str(), width, height, meta.resolution, meta.origin_x, meta.origin_y);
+  if (!setupMap(grid)) {
+    return false;
+  }
+  // 로드한 맵을 transient_local로 한 번 latch 발행(RViz/상위가 늦게 붙어도 수신).
+  if (map_pub_) {
+    map_pub_->publish(map_);
+  }
+  return true;
 }
 
 void mainNode::imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
