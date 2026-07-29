@@ -96,9 +96,17 @@ ros2 launch localization_pf localization_pf.launch.py params_file:=/path/to/conf
 3. `map_topic`(기본 `/map`)에 **transient_local**로 latch 발행합니다 — RViz나
    상위 노드가 늦게 붙어도 지도를 받습니다.
 
-`map/` 폴더에 표준 `map_server` 형식의 `map.yaml`(+`map.pgm`)이 샘플로 들어 있습니다.
-실제 지도로 교체하고 `map_loader.map_name`만 맞추면 됩니다. launch가 `map_dir`을
-소스 `map/` 폴더로 주입하므로 지도 교체도 재런치만으로 반영됩니다.
+`map/` 폴더에는 표준 `map_server` 형식의 샘플 지도가 두 개 들어 있습니다
+(`map.yaml`/`map.pgm`, `track2.yaml`/`track2.pgm`). 여러 지도를 이 폴더에 두고
+**config의 `map_loader.map_name` 값만 바꿔 재런치**하면 지도가 전환됩니다
+(`colcon build` 불필요):
+
+```yaml
+map_loader:
+  map_name: track2      # map/track2.yaml + track2.pgm 을 로드
+```
+
+실제 운용 시에는 자신의 지도 파일을 `map/`에 넣고 `map_name`을 맞추면 됩니다.
 
 외부 `map_server`를 쓰려면 `map_loader.enabled: false`로 두면 `map_topic`을
 구독합니다.
