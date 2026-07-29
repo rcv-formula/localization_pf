@@ -108,6 +108,11 @@ map_loader:
 
 실제 운용 시에는 자신의 지도 파일을 `map/`에 넣고 `map_name`을 맞추면 됩니다.
 
+지도 이미지는 **P5(binary)와 P2(ASCII) PGM을 모두** 읽으며, 16-bit(maxval>255)
+이미지는 8-bit로 자동 스케일합니다. 그림판·GIMP 등으로 편집해 어떤 방식으로
+저장하든 그대로 쓸 수 있습니다. 다만 PNG/BMP를 확장자만 `.pgm`으로 바꾼 파일은
+읽을 수 없으며, 이 경우 로그에 실제 감지된 형식과 해결 방법이 함께 출력됩니다.
+
 외부 `map_server`를 쓰려면 `map_loader.enabled: false`로 두면 `map_topic`을
 구독합니다.
 

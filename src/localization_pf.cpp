@@ -559,14 +559,26 @@ bool parseMapYaml(const std::string &path, MapMeta &out) {
   return !out.image.empty();
 }
 
-// P5(binary) PGM을 읽습니다. 주석 허용, maxval<256 가정.
+// PGM 리더. 편집기(GIMP/Paint 등)가 어떤 방식으로 저장해도 읽히도록
+// P5(binary)와 P2(ASCII)를 모두 지원하고, 16-bit(maxval>255)는 8-bit로
+// 스케일합니다. 실패하면 why에 원인을 채워 호출부가 로그로 남깁니다.
 bool loadPgm(const std::string &path, int &width, int &height,
-             std::vector<uint8_t> &pixels) {
+             std::vector<uint8_t> &pixels, std::string &why) {
   std::ifstream file(path, std::ios::binary);
-  if (!file) return false;
+  if (!file) {
+    why = "파일을 열 수 없습니다";
+    return false;
+  }
   std::string magic;
   file >> magic;
-  if (magic != "P5") return false;
+  const bool ascii = (magic == "P2");
+  if (magic != "P5" && !ascii) {
+    why = "PGM 매직이 '" + magic + "' 입니다. P5(binary) 또는 P2(ASCII)가 "
+          "필요합니다 — P6는 컬러(PPM), 그 외는 PNG/BMP를 .pgm 확장자로 "
+          "저장했을 가능성이 큽니다. 편집기에서 회색조 PGM(Raw)으로 다시 "
+          "저장하거나 `convert in.pgm -depth 8 out.pgm` 로 변환하세요";
+    return false;
+  }
   auto read_int = [&](int &value) {
     int c = file.get();
     while (true) {
@@ -579,10 +591,52 @@ bool loadPgm(const std::string &path, int &width, int &height,
   };
   int maxval = 0;
   read_int(width); read_int(height); read_int(maxval);
-  if (width <= 0 || height <= 0 || maxval <= 0 || maxval > 255) return false;
-  pixels.resize(static_cast<std::size_t>(width) * height);
-  file.read(reinterpret_cast<char *>(pixels.data()), pixels.size());
-  return static_cast<std::size_t>(file.gcount()) == pixels.size();
+  if (width <= 0 || height <= 0 || maxval <= 0 || maxval > 65535) {
+    why = "헤더가 올바르지 않습니다 (width=" + std::to_string(width) +
+          ", height=" + std::to_string(height) +
+          ", maxval=" + std::to_string(maxval) + ")";
+    return false;
+  }
+  const std::size_t count = static_cast<std::size_t>(width) * height;
+  const bool wide = maxval > 255;   // 16-bit 샘플
+  pixels.resize(count);
+
+  if (ascii) {
+    // P2: 공백으로 구분된 십진수 픽셀.
+    for (std::size_t i = 0; i < count; ++i) {
+      int v = 0;
+      if (!(file >> v)) {
+        why = "ASCII(P2) 픽셀이 " + std::to_string(i) + "개에서 끊겼습니다 (필요 " +
+              std::to_string(count) + "개)";
+        return false;
+      }
+      pixels[i] = static_cast<uint8_t>(
+        wide ? std::lround(v * 255.0 / maxval) : std::min(255, std::max(0, v)));
+    }
+    return true;
+  }
+
+  // P5: maxval에 따라 1바이트 또는 2바이트(big-endian) 샘플.
+  if (!wide) {
+    file.read(reinterpret_cast<char *>(pixels.data()), count);
+    if (static_cast<std::size_t>(file.gcount()) != count) {
+      why = "픽셀 데이터가 " + std::to_string(file.gcount()) + " 바이트로 부족합니다 (필요 " +
+            std::to_string(count) + ")";
+      return false;
+    }
+    return true;
+  }
+  std::vector<uint8_t> raw(count * 2);
+  file.read(reinterpret_cast<char *>(raw.data()), raw.size());
+  if (static_cast<std::size_t>(file.gcount()) != raw.size()) {
+    why = "16-bit 픽셀 데이터가 부족합니다";
+    return false;
+  }
+  for (std::size_t i = 0; i < count; ++i) {
+    const int v = (static_cast<int>(raw[2 * i]) << 8) | raw[2 * i + 1];
+    pixels[i] = static_cast<uint8_t>(std::lround(v * 255.0 / maxval));
+  }
+  return true;
 }
 
 }  // namespace
@@ -602,9 +656,10 @@ bool mainNode::loadMapFromFile(const std::string &map_dir,
   }
   int width = 0, height = 0;
   std::vector<uint8_t> pixels;
-  if (!loadPgm(image_path, width, height, pixels)) {
-    RCLCPP_ERROR(this->get_logger(), "map loader: cannot read PGM %s (P5 only)",
-                 image_path.c_str());
+  std::string why;
+  if (!loadPgm(image_path, width, height, pixels, why)) {
+    RCLCPP_ERROR(this->get_logger(), "map loader: cannot read PGM %s — %s",
+                 image_path.c_str(), why.c_str());
     return false;
   }
 
