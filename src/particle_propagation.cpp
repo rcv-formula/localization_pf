@@ -305,17 +305,47 @@ particlePropagation::TrajectoryPose particlePropagation::poseAt(
     return result;
 }
 
-// VESC 누적 displacement 카운터를 누적 미터 단위로 변환해 히스토리에 저장합니다.
+// VESC 상태를 누적 주행거리[m]로 바꿔 히스토리에 저장합니다.
 // EKF는 이후 보간된 누적 거리를 미분해서 속도 측정값으로 사용합니다.
+// 산출 경로는 두 가지이며(ekf.wheel_use_displacement), 어느 쪽이든 아래
+// 다운스트림(보간 -> 차분 -> 속도 관측)은 동일합니다.
 void particlePropagation::wheelGetter(vesc_msgs::msg::VescStateStamped current_vesc){
     builtin_interfaces::msg::Time cur_time;
     cur_time.sec = current_vesc.header.stamp.sec;
     cur_time.nanosec = current_vesc.header.stamp.nanosec;
-    const double tacometer = static_cast<double>(current_vesc.state.displacement) / 6.0;
-    const double trav_distance =
-        tacometer / static_cast<double>(motor_speed_gain) *
-        ekf_params_.wheel_scale;
     const double stamp = timeToSeconds(cur_time);
+
+    double trav_distance = 0.0;
+    if (ekf_params_.wheel_use_displacement) {
+        // (구 경로) 타코미터 카운트 -> 미터.
+        const double tacometer =
+            static_cast<double>(current_vesc.state.displacement) / 6.0;
+        trav_distance = tacometer / static_cast<double>(motor_speed_gain) *
+            ekf_params_.wheel_scale;
+    } else {
+        // (기본) vesc_to_odom과 동일하게 ERPM -> 속도[m/s]로 변환 후 적분.
+        //   v = (state.speed - speed_to_erpm_offset) / speed_to_erpm_gain
+        const double gain = ekf_params_.speed_to_erpm_gain;
+        double speed = 0.0;
+        if (std::isfinite(gain) && std::abs(gain) > 1.0e-9) {
+            speed = (static_cast<double>(current_vesc.state.speed) -
+                     ekf_params_.speed_to_erpm_offset) / gain;
+        }
+        // vesc_to_odom과 같은 저속 데드밴드.
+        if (std::abs(speed) < ekf_params_.erpm_speed_deadband) {
+            speed = 0.0;
+        }
+        speed *= ekf_params_.wheel_scale;
+        if (erpm_prev_stamp_ > 0.0) {
+            const double dt = stamp - erpm_prev_stamp_;
+            // 비정상 간격(역행/과대 점프)은 적분하지 않고 시각만 갱신합니다.
+            if (dt > ekf_params_.min_dt && dt < 1.0) {
+                erpm_cumulative_distance_ += speed * dt;
+            }
+        }
+        erpm_prev_stamp_ = stamp;
+        trav_distance = erpm_cumulative_distance_;
+    }
     wheel_history_.push_back(TimedWheel{cur_time, stamp, trav_distance});
     pruneSensorHistory(stamp);
 

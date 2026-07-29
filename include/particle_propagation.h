@@ -47,6 +47,20 @@ class particlePropagation{
         // shim이 같은 상수로 인코딩하므로 1.0이 맞고(맵/스캔과 자기일관 검증됨),
         // 실차에서 드라이버 상수가 다른 플랫폼이면 여기서 보정합니다(예: 2.6).
         double wheel_scale{1.0};
+        // 휠 주행거리 산출 경로 선택.
+        //  false(기본) : state.speed(ERPM)를 vesc_to_odom과 동일한 식으로
+        //                속도[m/s]로 바꾼 뒤 적분해 누적거리를 만듭니다.
+        //                  v = (speed - speed_to_erpm_offset) / speed_to_erpm_gain
+        //  true        : state.displacement(타코미터 카운트)를
+        //                displacement/6/motor_speed_gain 으로 환산합니다(구 경로).
+        // ERPM 경로가 플랫폼의 vesc_to_odom과 같은 단위계라 기본값입니다.
+        bool wheel_use_displacement{false};
+        // ERPM <-> 속도 변환. f1tenth_stack vesc.yaml과 같은 의미:
+        //   erpm = speed_to_erpm_gain * speed[m/s] + speed_to_erpm_offset
+        double speed_to_erpm_gain{1538.0};
+        double speed_to_erpm_offset{0.0};
+        // vesc_to_odom과 동일한 저속 데드밴드[m/s].
+        double erpm_speed_deadband{0.05};
         double min_dt{1.0e-4};
         double velocity_deadzone{0.03};
         double max_wheel_speed{30.0};
@@ -386,6 +400,9 @@ class particlePropagation{
     builtin_interfaces::msg::Time last_imu_time_;
     builtin_interfaces::msg::Time previous_wheel_time_;
     double previous_wheel_distance_{0.0};
+    // ERPM 경로 적분 상태: 직전 샘플 시각과 누적 주행거리[m].
+    double erpm_prev_stamp_{-1.0};
+    double erpm_cumulative_distance_{0.0};
     double last_yaw_rate_{0.0};
     double last_yaw_accel_{0.0};
     double last_rear_accel_x_{0.0};

@@ -330,6 +330,15 @@ void mainNode::declareParameters() {
   // ---- EKF (모션 모델) ----
   ekf_parameters_.wheel_scale = this->declare_parameter<double>(
     "ekf.wheel_scale", 1.0);
+  // 휠 주행거리 산출 경로: 기본은 vesc_to_odom과 동일한 ERPM 경로입니다.
+  ekf_parameters_.wheel_use_displacement = this->declare_parameter<bool>(
+    "ekf.wheel_use_displacement", false);
+  ekf_parameters_.speed_to_erpm_gain = this->declare_parameter<double>(
+    "ekf.speed_to_erpm_gain", 1538.0);
+  ekf_parameters_.speed_to_erpm_offset = this->declare_parameter<double>(
+    "ekf.speed_to_erpm_offset", 0.0);
+  ekf_parameters_.erpm_speed_deadband = this->declare_parameter<double>(
+    "ekf.erpm_speed_deadband", 0.05);
   ekf_parameters_.velocity_deadzone = this->declare_parameter<double>(
     "ekf.velocity_deadzone", 0.03);
   ekf_parameters_.max_wheel_speed = this->declare_parameter<double>(

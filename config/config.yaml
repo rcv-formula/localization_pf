@@ -51,10 +51,24 @@
 
     # --- wheel + IMU EKF (odometry) ---
     ekf:
-      # 휠 카운트->미터 보정 배율. 현재 데이터셋들은 인코더 계수가 2.6배
-      # 작게 기록되어 있어(스캔-앵커 검증 2.48~2.71) 2.6이 맞고, 새
-      # 플랫폼(계수 정상)에서는 1.0으로.
-      wheel_scale: 2.6
+      # --- 휠 주행거리 산출 경로 ---
+      # false(기본): state.speed(ERPM)를 vesc_to_odom과 동일한 식으로 속도로
+      #              바꾼 뒤 적분 —  v = (speed - offset) / speed_to_erpm_gain
+      # true       : state.displacement(타코미터 카운트) 사용(구 경로,
+      #              displacement/6/motor_speed_gain)
+      wheel_use_displacement: false
+      # ERPM <-> 속도 변환(vesc_to_odom과 동일한 식):
+      #   erpm = speed_to_erpm_gain * speed[m/s] + speed_to_erpm_offset
+      # 플랫폼 값. (참고: f1tenth_stack vesc.yaml 예시는 4000.66,
+      #  데이터셋 리플레이 shim은 1350)
+      speed_to_erpm_gain: 1538.0
+      speed_to_erpm_offset: 0.0
+      # vesc_to_odom과 동일한 저속 데드밴드[m/s].
+      erpm_speed_deadband: 0.05
+      # 산출된 주행거리에 곱하는 보정 배율. ERPM 경로는 게인이 물리값이라
+      # 1.0이 정상이고, 구 displacement 경로에서 계수가 어긋난 데이터셋을
+      # 재생할 때만 보정값(예: 2.6)을 씁니다.
+      wheel_scale: 1.0
       velocity_deadzone: 0.03
       max_wheel_speed: 30.0
       # 궤적 링버퍼/센서 히스토리 보관 시간(PF가 직전 스캔 시각을 되돌아볼

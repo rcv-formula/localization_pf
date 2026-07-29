@@ -120,7 +120,7 @@ map_loader:
 | `/map` | `nav_msgs/OccupancyGrid` | transient_local (latched) |
 | `/scan` | `sensor_msgs/LaserScan` | best-effort |
 | `/imu` | `sensor_msgs/Imu` | best-effort |
-| `/sensors/core` | `vesc_msgs/VescStateStamped` | 휠 odometry |
+| `/sensors/core` | `vesc_msgs/VescStateStamped` | 휠 odometry. 기본은 `state.speed`(ERPM)를 `vesc_to_odom`과 동일한 식으로 속도 변환 후 적분 (`ekf.speed_to_erpm_gain`). `ekf.wheel_use_displacement: true`로 두면 `state.displacement`(타코미터) 경로 |
 | `/tf`, `/tf_static` | — | `base_link → laser` extrinsic 조회 |
 
 (토픽 이름은 `config.yaml`에서 변경 가능)
