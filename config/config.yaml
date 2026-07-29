@@ -16,6 +16,9 @@
     imu_topic: /imu
     map_topic: /map
     vesc_state_topic: /sensors/core
+    # 최종 결과(map 기준 base_link pose)를 nav_msgs/Odometry로 내보낼 토픽.
+    # 관례상 /odom은 휠 오돔에 쓰이므로 충돌하는 스택에서는 이름을 바꾸세요.
+    odom_topic: /odom
 
     frames:
       map: map

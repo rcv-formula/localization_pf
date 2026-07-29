@@ -111,6 +111,9 @@ private:
   std::string scan_topic_{"/scan"};
   std::string imu_topic_{"/imu"};
   std::string map_topic_{"/map"};
+  // 최종 결과를 nav_msgs/Odometry로 내보낼 토픽. 관례상 /odom은 휠 오돔에
+  // 쓰이므로, 충돌하는 스택에서는 이 값을 바꿔 주세요.
+  std::string odom_topic_{"/odom"};
   // 자체 맵 로더: 켜면 map_dir/<map_name>.yaml+이미지를 읽어 localization에
   // 쓰고 map_topic에 latch 발행합니다. 끄면 외부 /map을 구독합니다.
   bool map_loader_enabled_{true};
@@ -291,6 +294,11 @@ private:
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
 
   rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
+  // 최종 pose를 nav_msgs/Odometry로도 발행합니다(frame: map, child: base_link).
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+  // twist(body frame)를 궤적 버퍼 차분으로 만들기 위한 직전 출력 샘플입니다.
+  double odom_prev_time_{-1.0};
+  Pose2D odom_prev_pose_{};
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr particles_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr scan_particles_pub_;
   // 순간 슬립: 수치 토픽(rqt_plot용) + 로봇 위 색상 텍스트 마커(RViz용).

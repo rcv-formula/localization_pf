@@ -84,6 +84,8 @@ mainNode::mainNode()
 
   pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "localization_pf/pose", 10);
+  // 같은 최종 pose를 nav_msgs/Odometry로도 발행합니다(상위 스택 호환용).
+  odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(odom_topic_, 10);
   particles_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>(
     "localization_pf/particles", 1);
   // 늦게 붙는 상위 제어도 현재 상태를 바로 받도록 transient_local로 둡니다.
@@ -158,6 +160,7 @@ void mainNode::declareParameters() {
   scan_topic_ = this->declare_parameter<std::string>("scan_topic", "/scan");
   imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu");
   map_topic_ = this->declare_parameter<std::string>("map_topic", "/map");
+  odom_topic_ = this->declare_parameter<std::string>("odom_topic", "/odom");
   // 자체 맵 로더. map_dir는 보통 launch가 패키지 map 폴더로 주입합니다.
   map_loader_enabled_ = this->declare_parameter<bool>("map_loader.enabled", true);
   map_loader_dir_ = this->declare_parameter<std::string>("map_loader.map_dir", "");
@@ -1675,6 +1678,40 @@ void mainNode::publishPose(const rclcpp::Time &stamp) {
     message.pose.covariance[35] = fused.yaw_variance;
   }
   pose_pub_->publish(message);
+
+  // ---- nav_msgs/Odometry 로도 같은 결과를 발행 ----
+  // frame_id = map, child_frame_id = base_link 이므로 pose는 map 기준 base_link
+  // 절대 위치입니다(관례적인 휠 오돔과 달리 전역 보정이 반영된 값).
+  if (!odom_pub_) {
+    return;
+  }
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = stamp;
+  odom.header.frame_id = map_frame_;
+  odom.child_frame_id = base_frame_;
+  odom.pose = message.pose;
+
+  // twist는 child frame(base_link) 기준입니다. 속도 접근자가 없으므로 연속한
+  // 출력 사이의 map 기준 이동을 body frame으로 돌려 유한차분으로 만듭니다.
+  const double now_seconds = stamp.seconds();
+  const Pose2D current{
+    message.pose.pose.position.x,
+    message.pose.pose.position.y,
+    normalizeAngle(map_to_odom_.yaw + sample.yaw)};
+  const double dt = now_seconds - odom_prev_time_;
+  if (odom_prev_time_ > 0.0 && dt > 1.0e-4 && dt < 0.5) {
+    const double dx = current.x - odom_prev_pose_.x;
+    const double dy = current.y - odom_prev_pose_.y;
+    const double cos_b = std::cos(current.yaw);
+    const double sin_b = std::sin(current.yaw);
+    odom.twist.twist.linear.x = (cos_b * dx + sin_b * dy) / dt;
+    odom.twist.twist.linear.y = (-sin_b * dx + cos_b * dy) / dt;
+    odom.twist.twist.angular.z =
+      normalizeAngle(current.yaw - odom_prev_pose_.yaw) / dt;
+  }
+  odom_prev_time_ = now_seconds;
+  odom_prev_pose_ = current;
+  odom_pub_->publish(odom);
 }
 
 void mainNode::publishParticles(const rclcpp::Time &stamp) {

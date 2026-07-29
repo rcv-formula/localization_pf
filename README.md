@@ -129,7 +129,8 @@ map_loader:
 
 | 토픽 | 타입 | 비고 |
 |---|---|---|
-| `localization_pf/pose` | `geometry_msgs/PoseWithCovarianceStamped` | 융합 pose, 100 Hz |
+| `localization_pf/pose` | `geometry_msgs/PoseWithCovarianceStamped` | 최종 융합 pose (frame: `map`), 100 Hz |
+| `/odom` (`odom_topic`) | `nav_msgs/Odometry` | **같은 최종 결과**, 100 Hz. `frame_id: map`, `child_frame_id: base_link` — 즉 map 기준 base_link 절대 pose. twist는 base_link 기준. 관례상 `/odom`은 휠 오돔용이므로 충돌 시 `odom_topic`으로 변경 |
 | `localization_pf/state` | `std_msgs/UInt8` | 0=Lost, 1=Converging, 2=Tracking |
 | TF `map → odom → base_link` | — | `base_link → laser` static은 선택 (`output.publish_laser_tf`) |
 | `localization_pf/{particles, scan_particles, slip, skipped_scan, latency, ...}` | — | 진단 / 시각화 |
