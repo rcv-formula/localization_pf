@@ -97,6 +97,10 @@ mainNode::mainNode()
     "localization_pf/skipped_scan", rclcpp::SensorDataQoS());
   latency_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>(
     "localization_pf/latency", 10);
+  // pose/odom과 같은 stamp로 발행되는 신뢰도 진단입니다. std_msgs 에는
+  // header가 없으므로 stamp를 배열 앞 두 칸에 담습니다.
+  confidence_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
+    "localization_confidence", 10);
   slip_marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
     "localization_pf/slip_marker", 1);
   reloc_reason_pub_ = this->create_publisher<visualization_msgs::msg::Marker>(
@@ -1263,6 +1267,8 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
   // relocalization을 트리거합니다. score 평균은 이 상태에 둔감해서
   // 기존 score 감시가 못 잡던 경로입니다.
   const auto beam_skip = scoring_->computeBeamSkip(particles, particle_count);
+  // 출력 타이머가 pose와 같은 stamp로 함께 내보낼 수 있도록 캐시합니다.
+  last_skip_fraction_ = beam_skip.proposed_fraction;
   if (beam_skip.applied && skipped_scan_pub_ &&
       skipped_scan_pub_->get_subscription_count() > 0) {
     sensor_msgs::msg::LaserScan skipped;
@@ -1491,6 +1497,7 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
     mean_score += value;
   }
   mean_score /= std::max(1, particle_count);
+  // 출력 타이머가 pose와 같은 stamp로 함께 내보낼 수 있도록 캐시합니다.
 
   // ---- 정합 건강도 -> 다음 사이클 예측 노이즈 ----
   // 두 신호의 min을 씁니다:
@@ -1507,6 +1514,9 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
     const double beam_health = frac_span > 1.0e-9 ?
       1.0 - std::clamp((fraction - outlier_frac_good_) / frac_span, 0.0, 1.0) : 1.0;
     propagation_->setNoiseHealth(std::min(score_health, beam_health));
+    // 신뢰도 토픽으로 내보낼 정규화 지표를 캐시합니다.
+    last_score_health_ = score_health;
+    last_outlier_fraction_ = fraction;
   }
 
   // ---- 다중 가설 수렴 판정 ----
@@ -1571,6 +1581,11 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
   }
 
   // 실데이터에서 어느 단계가 깨지는지 보려면 각 단계의 출력을 같이 봐야 합니다.
+  // ---- 신뢰도 지표 캐시 (출력 타이머가 pose와 같은 stamp로 발행) ----
+  last_pos_sigma_ = std::sqrt(std::max(0.0,
+    0.5 * (cloud.position_covariance(0, 0) + cloud.position_covariance(1, 1))));
+  last_dominant_mass_ = mode_summary.dominant_mass;
+
   RCLCPP_INFO_THROTTLE(
     this->get_logger(), *this->get_clock(), 1000,
     "fused(%.2f,%.2f,%.1f) pf(%.2f,%.2f,%.1f) d(%.3f,%.3f,%.3f) "
@@ -1711,6 +1726,45 @@ void mainNode::publishTransforms(const rclcpp::Time &stamp) {
   }
 }
 
+// 로컬라이제이션을 얼마나 믿을 수 있는지를 [0,1] 하나로 요약합니다.
+// 약한 고리(min) 방식 — 어느 한 축이 무너지면 전체가 내려갑니다. 로그우도
+// 하나로는 판별이 안 되므로(맵/빔 수에 따라 절대값이 달라짐) 정규화된 정합도,
+// 불일치 빔 비율, 구름 퍼짐, 가설 확정도를 함께 봅니다.
+double mainNode::localizationConfidence() const {
+  // (1) 스캔 정합도 — 이미 [0,1]로 정규화된 값
+  const double score_term = last_score_health_;
+
+  // (2) 불일치 빔 비율 — good 이하면 1, bad 이상이면 0
+  const double frac_span = outlier_frac_bad_ - outlier_frac_good_;
+  const double outlier_term = frac_span > 1.0e-9 ?
+    1.0 - std::clamp(
+      (last_outlier_fraction_ - outlier_frac_good_) / frac_span, 0.0, 1.0) : 1.0;
+
+  // (3) beam skip 제안 비율 — 위치 상실 문턱에 가까울수록 0으로
+  const double skip_term = beamskip_lost_fraction_ > 1.0e-9 ?
+    1.0 - std::clamp(last_skip_fraction_ / beamskip_lost_fraction_, 0.0, 1.0) : 1.0;
+
+  // (4) 파티클 구름 퍼짐 — 0.3 m에서 0.5가 되도록 사상
+  constexpr double kSigmaRef = 0.3;
+  const double spread_term = kSigmaRef * kSigmaRef /
+    (kSigmaRef * kSigmaRef + last_pos_sigma_ * last_pos_sigma_);
+
+  // (5) 지배 가설 질량 — 여러 가설이 살아 있으면 그만큼 불확실
+  const double mass_term = std::clamp(last_dominant_mass_, 0.0, 1.0);
+
+  const double weakest = std::min(
+    {score_term, outlier_term, skip_term, spread_term, mass_term});
+
+  // 상태로 최종 배율: Lost면 0, 판별 중이면 절반.
+  double state_factor = 1.0;
+  if (state_ == LocalizationState::Lost) {
+    state_factor = 0.0;
+  } else if (state_ == LocalizationState::Converging) {
+    state_factor = 0.5;
+  }
+  return std::clamp(state_factor * weakest, 0.0, 1.0);
+}
+
 void mainNode::publishPose(const rclcpp::Time &stamp) {
   if (!map_to_odom_valid_ || !propagation_ || !pose_pub_) {
     return;
@@ -1776,6 +1830,26 @@ void mainNode::publishPose(const rclcpp::Time &stamp) {
   odom_prev_time_ = now_seconds;
   odom_prev_pose_ = current;
   odom_pub_->publish(odom);
+
+  // ---- 신뢰도 진단 (pose/odom과 동일한 stamp) ----
+  // std_msgs 에는 header가 없으므로 stamp를 배열 앞 두 칸에 담아, 상위에서
+  // pose와 정확히 짝지을 수 있게 합니다. 배열 의미는 layout.dim 라벨 참고.
+  if (confidence_pub_) {
+    std_msgs::msg::Float64MultiArray conf;
+    conf.layout.dim.resize(3);
+    const char *labels[3] = {"stamp_sec", "stamp_nanosec", "confidence"};
+    for (std::size_t i = 0; i < 3; ++i) {
+      conf.layout.dim[i].label = labels[i];
+      conf.layout.dim[i].size = 1;
+      conf.layout.dim[i].stride = 1;
+    }
+    const int64_t total_ns = stamp.nanoseconds();
+    conf.data = {
+      static_cast<double>(total_ns / 1000000000LL),
+      static_cast<double>(total_ns % 1000000000LL),
+      localizationConfidence()};
+    confidence_pub_->publish(conf);
+  }
 }
 
 void mainNode::publishParticles(const rclcpp::Time &stamp) {

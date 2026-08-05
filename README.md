@@ -137,6 +137,7 @@ map_loader:
 | `localization_pf/pose` | `geometry_msgs/PoseWithCovarianceStamped` | 최종 융합 pose (frame: `map`), 100 Hz |
 | `/odom` (`odom_topic`) | `nav_msgs/Odometry` | **같은 최종 결과**, 100 Hz. `frame_id: map`, `child_frame_id: base_link` — 즉 map 기준 base_link 절대 pose. twist는 base_link 기준. 관례상 `/odom`은 휠 오돔용이므로 충돌 시 `odom_topic`으로 변경 |
 | `localization_pf/state` | `std_msgs/UInt8` | 0=Lost, 1=Converging, 2=Tracking |
+| `/localization_confidence` | `std_msgs/Float64MultiArray` | 신뢰도 `[stamp_sec, stamp_nanosec, confidence]`. pose/odom과 **동일한 stamp** 라 시각으로 짝지을 수 있습니다. `confidence` 는 [0,1] — 스캔 정합도·불일치 빔 비율·beam skip·파티클 구름 퍼짐·가설 확정도 중 **가장 나쁜 값**에 상태 배율(Lost 0, Converging 0.5)을 곱한 값 |
 | TF `map → odom → base_link` | — | `base_link → laser` static은 선택 (`output.publish_laser_tf`) |
 | `localization_pf/{particles, scan_particles, slip, skipped_scan, latency, ...}` | — | 진단 / 시각화 |
 

@@ -25,6 +25,7 @@
 #include "sensor_msgs/msg/imu.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/float32_multi_array.hpp"
+#include "std_msgs/msg/float64_multi_array.hpp"
 #include "std_msgs/msg/u_int8.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "tf2_ros/buffer.h"
@@ -311,6 +312,19 @@ private:
   std::deque<std::string> reloc_history_;
   // 벤치마크용 레이턴시 [interp_ms, processing_ms].
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr latency_pub_;
+  // 신뢰도 진단: pose와 같은 stamp로 발행해 상위에서 짝지을 수 있게 합니다.
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr confidence_pub_;
+  // 스캔 사이클(40Hz)에서 계산한 신뢰도 재료를 출력 타이머(100Hz)로 넘기는
+  // 캐시입니다. 로그우도 단독으로는 판별이 안 되므로(맵/빔 수에 따라 절대값이
+  // 달라짐) 정규화 지표와 구름 분산을 함께 봅니다.
+  double last_score_health_{1.0};     // score 정규화 [0,1]
+  double last_outlier_fraction_{0.0}; // 아웃라이어 빔 비율 [0,1]
+  double last_skip_fraction_{0.0};    // beam skip 제안 비율 [0,1]
+  double last_pos_sigma_{0.0};        // 파티클 구름 위치 표준편차 [m]
+  double last_dominant_mass_{0.0};    // 지배 가설 질량 [0,1]
+  // 위 재료를 하나로 합친 신뢰도 [0,1]. 약한 고리(min) 방식이라 어느 하나가
+  // 나빠지면 값이 떨어집니다.
+  double localizationConfidence() const;
   // beam skip 시각화: 스킵된 빔만 담은 LaserScan(나머지 NaN).
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr skipped_scan_pub_;
   // 0=Lost, 1=Converging, 2=Tracking. transient_local이라 늦게 붙는 상위
