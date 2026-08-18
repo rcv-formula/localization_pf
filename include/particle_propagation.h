@@ -95,6 +95,13 @@ class particlePropagation{
         double roll_damping_ratio{0.8};
         double roll_accel_gain{0.02};
 
+        // --- 경량 dead-reckoning(궤적 버퍼 = 100 Hz 출력의 보간 대상) ---
+        // IMU 자세(AHRS quaternion)로 기울기를 보정합니다. 끄면 평지 가정.
+        bool dr_use_imu_tilt{true};
+        // 기준자세 대비 이보다 기울면 평면 주행이 아니므로(들어올림/전복)
+        // 보정을 중단하고 평지 식으로 되돌립니다.
+        double dr_tilt_max_deg{45.0};
+
         double gravity_pitch_sign{1.0};
         double gravity_roll_sign{-1.0};
         double accel_gravity_sign{1.0};
@@ -180,6 +187,9 @@ class particlePropagation{
     // IMU 샘플마다 채워진 궤적 링버퍼를 보간해 해당 시각의 pose를 돌려줍니다.
     // 과거 시각 조회가 가능하므로, 100Hz 출력 경로가 앞서 나가더라도 PF는
     // scan 시각의 pose를 정확히 얻을 수 있습니다.
+    // 기준 자세 대비 상대 기울기[deg] 중 큰 쪽(roll/pitch). 기준이 아직
+    // 잡히지 않았으면 0. 전복/들림 구간의 스캔을 이력에서 빼는 데 씁니다.
+    double relativeTiltDeg() const;
     TrajectoryPose poseAt(double target_seconds) const;
     TrajectoryPose poseAt(builtin_interfaces::msg::Time target_time) const;
 
@@ -354,6 +364,10 @@ class particlePropagation{
         const GravityCalibrationEstimate &estimate,
         GravityCalibrationState state);
     Eigen::Vector3d calcGravityBody(const StateVector &state) const;
+    // IMU AHRS quaternion에서 차대 기울기(시동 자세 대비 roll/pitch)를 뽑습니다.
+    // 성공하면 true. 자세를 안 주는 IMU이거나 과대 기울기면 false.
+    bool chassisTiltFromImu(
+        const TimedImu &imu_sample, double &roll, double &pitch);
     std::string gravityCalibrationPath() const;
     // 저지연 센서 보간/외삽 보조 함수들입니다.
     bool interpolateImu(double target_time, TimedImu *imu_sample) const;
@@ -414,6 +428,14 @@ class particlePropagation{
     GravityCalibrationState gravity_calibration_state_{
         GravityCalibrationState::WaitingForStability};
     GravityCalibrationEstimate gravity_calibration_;
+    // 경량 DR의 기울기 기준자세. AHRS는 절대 자세를 주므로 IMU 장착 기울기를
+    // 빼기 위해 시동 시점을 기준으로 잡습니다(중력 보정과 같은 전제).
+    bool dr_tilt_reference_valid_{false};
+    double dr_tilt_reference_roll_{0.0};
+    double dr_tilt_reference_pitch_{0.0};
+    double last_dr_tilt_roll_{0.0};
+    double last_dr_tilt_pitch_{0.0};
+    bool last_dr_tilt_valid_{false};
     StateVector ekf_state_;
     StateMatrix ekf_covariance_;
     std::deque<YawRateSample> yaw_rate_history_;

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <deque>
+#include <future>
 #include <memory>
 #include <random>
 #include <string>
@@ -39,6 +40,7 @@ class mainNode : public rclcpp::Node
 {
 public:
   mainNode();
+  ~mainNode();
 
 private:
   // 전역 초기화가 끝나기 전에는 추적을 시작하지 않습니다.
@@ -77,7 +79,51 @@ private:
   //                        -> estimate -> 이방성 융합 -> map->odom 갱신
   void runFilterCycle(const sensor_msgs::msg::LaserScan &scan);
   // Lost 상태에서 전역 위치를 찾습니다. 성공하면 파티클을 다시 뿌립니다.
-  bool tryRelocalize(const sensor_msgs::msg::LaserScan &scan);
+  // 전역 탐색은 수백 ms가 걸립니다. 단일 스레드 executor에서 콜백 안에 두면
+  // 그동안 100 Hz 출력 타이머가 통째로 굶어 pose가 100 ms 넘게 끊깁니다.
+  // 그래서 (a) 메인 스레드에서 입력만 스냅샷하고 (b) 워커 스레드에서 탐색을
+  // 돌린 뒤 (c) 결과를 다시 메인 스레드에서 수확해 시드합니다.
+  struct GlobalSearchRequest {
+    std::vector<sensor_msgs::msg::LaserScan> scans;
+    std::vector<Relocalization::RelativeMotion> motions;
+    // 비어 있지 않으면 궤적 정합을 먼저 시도합니다.
+    std::vector<std::array<double, 2>> trajectory_points;
+    double laser_yaw{0.0};
+    double trajectory_distance{0.0};
+    double trajectory_rotation{0.0};
+  };
+  struct GlobalSearchResult {
+    std::vector<Relocalization::Hypothesis> hypotheses;
+    double elapsed_ms{0.0};
+    std::size_t scan_points{0};
+    bool from_trajectory{false};
+    double trajectory_distance{0.0};
+    double trajectory_rotation{0.0};
+    // 워커 스레드에서는 로거를 만지지 않고, 메인 스레드에서 출력합니다.
+    std::string error;
+  };
+  GlobalSearchRequest buildGlobalSearchRequest(
+    const sensor_msgs::msg::LaserScan &scan);
+  // 현재 EKF dead reckoning 기준 라이다 pose(파티클과 같은 프레임).
+  bool currentLaserDrPose(double &x, double &y, double &yaw) const;
+  // 스캔 요약값(유효 빔 평균 사거리)과 직전 시도 대비 변화량[m].
+  static double scanSignature(const sensor_msgs::msg::LaserScan &scan);
+  double scanChangeMetric(const sensor_msgs::msg::LaserScan &scan) const;
+  // 전역 탐색을 돌려도 되는 관측인지. 유효점 비율 + 자세 + 연속 스캔
+  // 자기일관성(DR SE(2) 보정 후 빔별 사거리 비교)을 모두 만족해야 한다.
+  bool searchPreconditionsMet(const sensor_msgs::msg::LaserScan &scan,
+                              std::string &reason);
+  // 매 스캔 호출 — 연속 스캔 자기일관성 스트릭을 갱신합니다.
+  void updateScanConsistency(const sensor_msgs::msg::LaserScan &scan);
+  GlobalSearchResult executeGlobalSearch(const GlobalSearchRequest &request);
+  // 워커가 끝났으면 결과를 수확해 시드합니다. 시드했으면 true.
+  bool harvestRelocalization();
+  // 감시 창의 스킵 중심이 맵에서 빠르게 움직였는가 = 움직이는 물체인가.
+  // speed_out/ego_out은 로그용(각각 중심 속도, 에고 속도).
+  bool skipLooksDynamic(double &speed_out, double &ego_out) const;
+  void scoreAllParticles(particle *particles, int32_t particle_count);
+  // 워커가 도는 중이면 끝날 때까지 기다립니다(맵 교체/종료 시 필수).
+  void waitForRelocalizationWorker();
   // 상태 전이는 반드시 이 함수로 해서 상태 토픽과 어긋나지 않게 합니다.
   void setState(LocalizationState next);
   void publishState();
@@ -88,8 +134,6 @@ private:
   // 이동/회전 간격을 만족할 때 스캔을 히스토리에 남깁니다(모든 상태 공용).
   void updateScanHistory(const sensor_msgs::msg::LaserScan &scan);
   // 히스토리가 있으면 multi-scan, 없으면 단일 스캔 전역 탐색을 돌립니다.
-  std::vector<Relocalization::Hypothesis> runGlobalSearch(
-    const sensor_msgs::msg::LaserScan &scan);
   // base 위치가 주행 가능(free) 셀인지 봅니다. 맵 밖/unknown/occupied는 false.
   bool isFreeCell(double x, double y) const;
   // 스캔 탐색 풀 한 사이클: 이동 적용 -> 채점 -> 컬링/복제 -> 우위 시 주입.
@@ -128,6 +172,81 @@ private:
   // Lost 상태에서 relocalization을 시도하는 최소 간격입니다.
   // 전역 탐색은 수백 ms가 걸리므로 매 scan마다 시도하지 않습니다.
   double relocalize_period_s_{1.0};
+  // 직전 시도가 빈손일 때의 짧은 재시도 주기. 실패가 반복되는 구간은 대개
+  // 입력이 나쁜 구간이라, 입력이 좋아지는 순간을 놓치지 않는 게 중요합니다.
+  double relocalize_retry_period_s_{0.1};
+  // 장면이 이만큼 바뀌면(평균 사거리 변화[m]) 주기를 무시하고 즉시 시도.
+  double reloc_scan_change_m_{0.5};
+  bool reloc_last_empty_{false};
+  // ---- 전역 탐색 전제조건 ----
+  //
+  // 관측이 무의미한 구간에서 탐색을 돌리면 13만 후보 중 "반쯤 눈먼 스캔에
+  // 그럴듯한" 앨리어스가 반드시 나오고, 게이트는 그 스캔만 보므로 막지
+  // 못한다(실측 icra: 유효점 266/541, 붕괴 0.07초 뒤 시드, 17 m 오차,
+  // 모든 게이트 통과). 스캔이 신뢰할 만해질 때까지 탐색 자체를 멈춘다.
+  double search_min_valid_ratio_{0.6};
+  double search_max_tilt_deg_{15.0};
+  double search_consistency_inlier_m_{0.2};
+  double search_consistency_fraction_{0.8};
+  int search_consistency_frames_{3};
+  int search_consistency_ok_count_{0};
+  double last_consistency_fraction_{0.0};
+  // 자기일관성 비교용 직전 스캔과 그 시각의 DR pose.
+  sensor_msgs::msg::LaserScan prev_scan_;
+  bool prev_scan_valid_{false};
+  double prev_scan_dr_x_{0.0};
+  double prev_scan_dr_y_{0.0};
+  double prev_scan_dr_yaw_{0.0};
+  // ---- 전복/미아 구간 DR 오차 계측 ----
+  //
+  // 전복은 kidnap이 아니라 '관측 정전'이다 — pose가 무효가 된 게 아니라
+  // 관측이 무효가 된 것이고, 그동안의 이동은 물리적으로 유계다. 그렇다면
+  // 전역 탐색 대신 마지막 정상 pose 주변 로컬 탐색으로 복구하는 게 맞는데,
+  // 그 반경을 정하려면 "정전 구간을 통과한 DR이 얼마나 틀리는가"를 알아야
+  // 한다. Lost 진입 시 (융합 pose, DR pose)를 기억해 두고, 복구 시드 때
+  // 예측(마지막 융합 + 그동안의 DR)과 실제 시드의 차이를 남긴다.
+  bool lost_anchor_valid_{false};
+  double lost_fused_x_{0.0};
+  double lost_fused_y_{0.0};
+  double lost_fused_yaw_{0.0};
+  double lost_dr_x_{0.0};
+  double lost_dr_y_{0.0};
+  double lost_dr_yaw_{0.0};
+  double lost_stamp_{0.0};
+  // 이번 Lost 에피소드에 IMU 자세 이벤트(전복/들림)가 있었는가. 있으면
+  // heading prior가 정당하게 무효이므로 플립 조항을 면제한다.
+  bool lost_imu_event_{false};
+  // ---- 플립 조항 ----
+  //
+  // prior와 90도 넘게 다른 시드는 '비범한 주장'이라 비범한 증거를 요구한다.
+  // 다만 하드 블록은 금지다 — 이전 시드가 플립이라 prior가 뒤집혀 있고 새
+  // 후보가 교정인 경우, 교정 후보는 건강한 이력 지지를 갖고 있어 상향된
+  // 기준을 통과한다(실측 busan2 정상 시드: 지지율 1.00). 조항이 교정을 막는
+  // 경로는 없다.
+  bool flip_clause_enabled_{true};
+  double flip_clause_deg_{90.0};
+  double flip_majority_fraction_{0.7};
+  double flip_max_see_through_{0.10};
+  // ---- 이력 다수결 밴드 + 보호관찰 ----
+  //
+  // 하드 이분법은 두 가지로 실패한다. (1) 교정 시드를 막는다 — 체인이 열화된
+  // 상황에서는 정답도 지지 증거가 흐려진다(실측 icra seed3: 지지율 0.47).
+  // (2) 데드락 — Lost 중에는 이력이 동결되므로 다음 재시도도 같은 뷰로 같은
+  // 판정을 내려 영원히 거부한다.
+  //
+  // 그래서 애매한 구간은 거부가 아니라 '보호관찰'로 심는다: 적은 질량으로
+  // 함께 심고 주행이 판별하게 한다. 맞으면 살아남아 지연이 0이고, 틀리면
+  // 조용히 죽는다.
+  bool majority_band_enabled_{false};
+  double majority_accept_{0.60};
+  double majority_probation_{0.25};
+  double probation_mass_{0.3};
+  // 데드락 보험: Lost가 이 시간을 넘고 그동안 모든 후보가 거부 밴드였다면
+  // 최선 후보를 보호관찰로 승격한다. 반복을 '정답의 증거'로 쓰는 게 아니라
+  // '게이트 교착의 증거'로 써서 중재로 넘기는 것이다.
+  double majority_escape_s_{5.0};
+  // 직전 시도에 쓴 스캔의 요약값(평균 사거리). 0이면 없음.
+  double reloc_attempt_signature_{0.0};
   // 리샘플링을 허용할 최소 이동/회전량입니다. 정지 중 다양성 고갈을 막습니다.
   double resample_min_translation_{0.02};
   double resample_min_rotation_{0.01};
@@ -143,6 +262,12 @@ private:
   // 않습니다(0526-1 교훈).
   double converge_mass_{0.9};
   double converge_distance_m_{1.0};
+  // 수렴 누적을 기하 관측성으로 가중할지. 끄면 기존 생거리 누적.
+  bool converge_use_observability_{false};
+  // 퇴화 구간 무한 대기 방지용 생(raw) 이동량 상한 배수.
+  double converge_raw_cap_factor_{3.0};
+  double converge_raw_translation_{0.0};
+  double converge_raw_rotation_{0.0};
   // 직선 주행에서는 복도 앨리어스끼리 똑같이 잘 맞아 판별이 안 됩니다
   // (0526-1 스래싱 교훈: 판별은 전부 코너에서 일어남). 수렴에는 거리와
   // 함께 이만큼의 누적 회전(코너 통과)이 필요합니다.
@@ -238,6 +363,16 @@ private:
   Pose2D map_to_odom_{};
   bool map_to_odom_valid_{false};
   rclcpp::Time last_relocalize_attempt_{0, 0, RCL_ROS_TIME};
+  std::future<GlobalSearchResult> reloc_future_;
+  bool reloc_in_flight_{false};
+  // 탐색을 시작한 순간의 라이다 DR pose. 탐색이 도는 동안에도 EKF는 계속
+  // 전진하므로, 수확 시점에 그만큼의 이동을 가설에 합성해야 시드가 현재
+  // 시각과 맞습니다. (동기 구현에서는 executor가 막혀 EKF도 함께 멈췄기
+  // 때문에 이 보정이 필요 없었습니다.)
+  bool reloc_anchor_valid_{false};
+  double reloc_anchor_x_{0.0};
+  double reloc_anchor_y_{0.0};
+  double reloc_anchor_yaw_{0.0};
   // 진단용 카운터입니다. raw_gyro_yaw_는 EKF를 거치지 않은 자이로 적분으로,
   // 데이터셋에서 휠오돔 yaw와 일치함을 확인한 사실상의 정답 회전입니다.
   double raw_gyro_yaw_{0.0};
@@ -272,6 +407,32 @@ private:
   // beam skip 합의붕괴 프레임 링버퍼(창 N, 1비트/프레임).
   std::deque<bool> beamskip_bad_frames_;
   int beamskip_bad_count_{0};
+  // 스킵 빔 중심의 세계 좌표 궤적(감시 창과 같은 길이).
+  //
+  // 목적은 미아를 더 잘 잡는 게 아니라, 미아가 아닌 상황을 미아로 만드는
+  // 것을 줄이는 것이다. 같은 속도로 앞서가는 상대차는 로봇 프레임에서
+  // 정지라 창 조건을 그대로 통과하지만, 세계 좌표에서는 에고 속도로
+  // 움직인다.
+  //
+  // 좌표는 직전 융합 pose(스캔 보정 포함, 맵 프레임)로 낸다. 이 환경은
+  // 휠 슬립이 심해 dead reckoning으로는 정지 물체도 움직이는 것처럼 보인다.
+  // 각 샘플이 자기 시점의 보정된 pose를 쓰므로 창 안에 DR 누적이 없고,
+  // 감시가 무장된 구간은 아직 미아 확정 전이라 PF pose가 유효하다.
+  struct SkipCentroidSample {
+    double x{0.0};        // 스킵 중심 (odom)
+    double y{0.0};
+    double ego_x{0.0};    // 같은 시각의 라이다 DR pose (odom)
+    double ego_y{0.0};
+    double stamp{0.0};
+    bool valid{false};
+  };
+  std::deque<SkipCentroidSample> beamskip_centroids_;
+  bool dynamic_skip_reject_{false};
+  double dynamic_skip_speed_mps_{0.3};
+  double dynamic_skip_ego_ratio_{0.5};
+  // 속도 추정의 최소 근거. 표본이 적거나 baseline이 짧으면 판단하지 않는다.
+  int dynamic_skip_min_samples_{4};
+  double dynamic_skip_min_dt_{0.1};
   // multi-scan용 스캔 히스토리. pose는 캡처 시점에 조회한 DR(odom) 프레임
   // 라이다 pose라 오래된 궤적 버퍼 조회가 필요 없습니다.
   struct ScanSnapshot {

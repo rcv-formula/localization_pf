@@ -109,6 +109,14 @@ public:
         // 각도 기준이 별도라 같은 위치의 180도 플립은 다른 가설로 남습니다.
         double hypothesis_min_separation_m{0.8};
         double hypothesis_min_separation_deg{25.0};
+        // 가설의 절대 품질 하한 — 예측 프로파일 대비 RMS 오차[m].
+        //
+        // hypothesis_score_ratio는 best 대비 '상대' 기준이라, best 자체가
+        // 쓰레기면 하한도 같이 무너진다(실측 icra: best score -20.6 = RMS
+        // 4.5 m인데 ratio 3.0의 하한은 -61.8이라 무사통과 -> 맵과 전혀 안
+        // 맞는 자리에 시드 -> 곧바로 재리로컬). 절대 기준을 함께 둔다.
+        // 정상 시드는 RMS 0.17~0.63 m 범위였다. 0 이하면 비활성.
+        double hypothesis_max_rms_m{1.0};
 
         // ----- 가설 검증 게이트 -----
         // 후보 pose의 예측 프로파일 대비 실측 인라이어(|오차|<inlier_m)
@@ -117,11 +125,74 @@ public:
         double hypothesis_verify_fraction{0.7};
         double hypothesis_verify_inlier_m{0.2};
 
+        // ----- 부호 인식(원사이드) 검증 게이트 -----
+        // 잔차 e = 실측 - 예측의 '부호'가 결정적 정보다. 미지도 물체/사람/
+        // 잔해는 빔을 짧게만 만들 수 있으므로(e<0), 정답 pose에서 e>0(예측한
+        // 벽 너머가 보임)은 맵 오류나 유리 말고는 설명되지 않는다. 반면 오답
+        // pose는 양쪽 부호가 섞인다(복도 종방향 오프셋이면 한쪽 끝은 e>0).
+        // |e|만 보는 RMS와 인라이어 비율은 이 정보를 통째로 버려서 서로
+        // 반대 판정을 냈다(실측: RMS 0.36인데 inlier 0.54로 거부 -> 8초 뒤
+        // RMS 0.86이 통과).
+        //
+        // false면 기존 인라이어 게이트로 판정하고 통계만 계산한다(섀도 모드).
+        bool verify_signed_gate{false};
+        // e < -이 값이면 '가림'으로 보고 분모에서 제외한다.
+        double verify_occlusion_m{0.2};
+        // e > +이 값이면 'see-through'(예측 벽 관통) = 오답의 증거.
+        double verify_see_through_m{0.25};
+        // 가시 빔 중 see-through 허용 상한. 5%는 유리문 하나(5m에서 0.9m 폭
+        // = 약 10도)가 예산을 통째로 먹으므로 10%에서 시작한다.
+        double verify_see_through_max{0.10};
+        // 가시 빔(전체 - 가림) 중 인라이어 비율 하한.
+        double verify_visible_fraction{0.8};
+        // 가림이 분모를 다 먹어치운 퇴화 pose를 막는 커버리지 하한.
+        double verify_min_visible_frac{0.40};
+        // 30도 섹터(720빔 격자에서 60빈)당 가시 빔이 이 개수 이상이면 유효.
+        std::size_t verify_min_sector_beams{15};
+        // 유효 섹터가 이 개수 이상이어야 한다(4 = 실효 120도).
+        std::size_t verify_min_visible_sectors{4};
+
         // ----- multi-scan 공동 채점 -----
         // 최신 스캔의 후보 pool에서 이 개수까지 골라 과거 스캔들과 공동
         // 채점합니다. 단일 스캔은 닮은꼴 복도/루프를 구분하지 못하지만
         // (0526-1 전역 앨리어스), 코너를 포함한 궤적 모양은 유일합니다.
         std::size_t multi_scan_top_candidates{64};
+        // 이력 공동 채점의 집계 방식 — 최신 1장 + '유효 이력 상위 비율'의 평균.
+        //
+        // 전부 평균내면 오염된 한 장이 모든 후보를 함께 떨어뜨리고(실측 icra:
+        // 전복 뒤 30초 가설 0개), 반대로 상위 1장만 쓰면 나머지가 일제히
+        // 반대한다는 증거를 계산해놓고 소거한다(실측: 텀블 중 0.1초 만에
+        // 17m 오시드가 모든 게이트를 통과). 단방향 절사가 두 실패를 함께 막는다:
+        // 오염은 점수를 끌어내리기만 하므로 하위를 자르고, 요행 정합은 상위
+        // 소수에만 생기므로 상위 60% 평균이면 희석된다. 앨리어스에게
+        // "요행 1장"이 아니라 "요행 다수"를 요구하게 된다.
+        double history_support_fraction{0.6};
+        // 재투영 DR 거리가 이보다 먼 이력 스캔은 집계에서 제외(노후 방어).
+        double history_valid_dr_max_m{4.0};
+        // 뷰 자격: 가시분율이 이보다 낮으면 기권(채점에서 제외). 점수가 가시
+        // 기준이라 근맹 뷰가 우연히 최고 점수를 가져가는 것을 막는다.
+        // 채점은 경성 0.5, 검증은 연성 가중(w_vis 램프)으로 분리한다.
+        double history_min_visible_frac{0.5};
+        // ----- 이력 가중 다수결 (결정 2) -----
+        // 뷰별 판정은 절대 RMS 컷을 쓸 수 없다 — 씬별 스케일 차이로 지지/반대
+        // 대역이 겹친다(실측: icra 지지 뷰 1.18~1.51 vs busan2 반대 뷰
+        // 1.50~2.36). 뷰 '내부'에서 자기 최선 대비 상대 비교를 한다.
+        bool history_majority_gate{false};   // false면 판정은 안 하고 로깅만
+        // 뷰 최선 대비 통과 밴드: visRMS <= max(ratio*best, best + slack).
+        // 가산 슬랙이 없으면 best가 작을 때(0.2) 잡음 수준 차이로 탈락한다.
+        double history_pass_ratio{1.5};
+        double history_pass_slack_m{0.3};
+        // 어떤 후보도 이만큼 이하로 설명하지 못하는 뷰는 기권(무의견).
+        double history_view_useless_m{1.5};
+        // 가시분율 -> 검증 가중 램프.
+        double history_weight_low_f{0.3};
+        double history_weight_high_f{0.7};
+        // 통과율 요구와 증거량 하한.
+        double history_majority_fraction{0.5};
+        double history_min_support_weight{2.0};
+        // false면 점수는 예전 방식(최신 + 과거 최고 1장)으로 내고 새 집계는
+        // 로깅만 한다(섀도 모드).
+        bool history_new_aggregate{false};
 
         // ----- 궤적-모양 전역 정합 -----
         // 누적 DR 궤적을 free-공간에 회전x평행이동 전역 탐색으로 정합
@@ -136,6 +207,26 @@ public:
         std::size_t trajectory_keep{8};
     };
 
+    // 부호 인식 검증의 원재료입니다. 비율이 아니라 정수 카운트를 남기는 이유는
+    // 나중 소프트 시딩에서 "0.9가 40빔짜리인지 400빔짜리인지"가 신뢰도 보정에
+    // 필요하기 때문입니다(라플라스/윌슨 보정에 N이 있어야 함).
+    struct VerifyStats {
+        uint16_t total{0};           // 채점에 쓴 유효 빔
+        uint16_t occluded{0};        // e < -occlusion_m : 가림, 분모 제외
+        uint16_t inlier{0};          // 대역 +- inlier_m 이내
+        uint16_t see_through{0};     // e > +see_through_m : 예측 벽 관통
+        uint16_t visible_sectors{0}; // 가시 빔이 충분한 30도 섹터 수
+        float visible_rms{0.0f};     // 가시 빔만의 RMS[m] (대역 안은 오차 0)
+        float visible_inlier_frac{0.0f};
+        float see_through_frac{0.0f};
+        float visible_frac{0.0f};
+        bool pass{false};
+        // bit0 커버리지, bit1 섹터, bit2 인라이어, bit3 see-through, bit4 RMS.
+        // 단락 없이 전부 평가해 채웁니다 — 섀도 모드에서 "무엇이 죽였나"를
+        // 한 줄로 읽기 위한 것입니다.
+        uint8_t fail_mask{0};
+    };
+
     // relocalizeMultiple이 돌려주는 전역 pose 가설입니다(점수 내림차순).
     struct Hypothesis {
         double x{0.0};
@@ -144,6 +235,15 @@ public:
         double score{0.0};
         // 검증 인라이어 비율(|빔 오차| < verify_inlier_m 비율).
         double inlier{0.0};
+        VerifyStats verify{};
+        // 이 후보에 대한 이력 뷰별 (가시 RMS, 가시분율). 시드된 가설의 지지
+        // 패턴을 봐야 하므로 후보마다 들고 다닌다 — 진단 배열에 1등 후보만
+        // 담으면 집계 후 순위가 바뀌어 다른 후보의 값을 보게 된다.
+        std::array<float, 16> view_rms{};
+        std::array<float, 16> view_visible{};
+        std::uint8_t view_count{0};
+        float support_ratio{0.0f};
+        float support_weight{0.0f};
     };
 
     // 한 번의 relocalize 호출에서 무엇이 얼마나 걸러졌는지 보고합니다.
@@ -155,6 +255,30 @@ public:
         // 채택된 후보의 정합 점수(클수록 좋음)와 사용한 스캔 점 개수입니다.
         double best_score{0.0};
         std::size_t scan_points{0};
+        // 가설 선별에서 무엇이 몇 개나 걸렸는지 — "후보가 없다"와 "후보는
+        // 있는데 게이트에 걸렸다"를 구분하기 위한 계수입니다.
+        std::size_t pool_size{0};
+        std::size_t rejected_score_floor{0};
+        std::size_t absorbed_duplicate{0};
+        std::size_t rejected_verify{0};
+        std::size_t rejected_verify_inlier{0};
+        std::size_t rejected_verify_seethrough{0};
+        std::size_t rejected_verify_coverage{0};
+        std::size_t accepted{0};
+        // 게이트 통과 여부와 무관한 최고 인라이어 비율.
+        double best_inlier{0.0};
+        // 점수 1등 후보의 신·구 집계 점수와 이력별 점수(포렌식/섀도 비교용).
+        double top_score_old{0.0};
+        double top_score_new{0.0};
+        std::array<float, 16> top_view_scores{};
+        // 같은 뷰의 가시분율 — "가림이 원인인가"를 판정하는 핵심 열.
+        std::array<float, 16> top_view_visible{};
+        std::uint8_t top_view_count{0};
+        std::uint8_t top_view_valid{0};
+        // 검증까지 도달한 후보 중 점수 1등의 통계(통과 여부 무관).
+        // 거부된 후보를 봐야 어느 게이트가 정답을 죽였는지 알 수 있습니다.
+        VerifyStats best_verify{};
+        bool best_verify_valid{false};
     };
 
     explicit Relocalization(const nav_msgs::msg::OccupancyGrid &map);
@@ -300,6 +424,13 @@ private:
         double y{0.0};
         double yaw{0.0};
         double score{0.0};
+        // 이력 뷰별 통계(공동 채점 경로에서만 채워짐).
+        std::array<float, 16> view_rms{};
+        std::array<float, 16> view_visible{};
+        std::uint8_t view_count{0};
+        // 가중 다수결 결과.
+        float support_ratio{0.0f};   // sum(w*pass) / sum(w)
+        float support_weight{0.0f};  // sum(w) — 증거의 양
     };
 
     struct SearchResult {
@@ -364,8 +495,27 @@ private:
         double best_score,
         const ScanView *verify_view = nullptr) const;
     // (x,y,yaw) 예측 프로파일 대비 실측 인라이어 비율입니다.
-    double inlierFraction(
+    // 빔 분류(가림/인라이어/see-through, +-1빈 대역)를 한 곳에서 수행합니다.
+    //
+    // 채점과 검증이 반드시 같은 루틴을 소비해야 합니다. 예전에는 검증만
+    // 부호를 알고 이력 채점은 부호맹이라 의미론이 갈렸고, 그 결과 가림이
+    // 반대표로 오역됐습니다(실측 busan2: 40cm 장애물에 가려진 이력 9장이
+    // 정답 pose에서 원시 RMS 1.45~2.91을 내 정답을 탈락 직전까지 밀어냄).
+    // 경로가 하나면 이런 분열이 재발할 수 없습니다.
+    VerifyStats computeBeamStats(
         double x, double y, double yaw, const ScanView &view) const;
+    // 부호 인식 검증 = 빔 분류 + 게이트 판정.
+    VerifyStats verifyPose(
+        double x, double y, double yaw, const ScanView &view) const;
+    // 모든 시드 후보의 단일 관문 — 표준 채점(latest + 가중 이력) + 게이트.
+    // 경로마다 게이트를 중복 구현하면 언젠가 한 곳을 빠뜨리고, 점수 단위가
+    // 갈리면 절대 하한과 상대 배율이 잴 것을 잃는다.
+    std::vector<Hypothesis> finalizeCandidates(
+        std::vector<PoseCandidate> &shortlist,
+        const ScanView &latest,
+        const std::vector<ScanView> &views,
+        const std::vector<RelativeMotion> &offsets);
+    static double legacyInlierFraction(const VerifyStats &stats);
 
     // motions(연속 상대이동)를 "최신 프레임에서 본 각 스캔의 오프셋"으로
     // 접습니다. 마지막 원소는 항상 (0,0,0)입니다.
@@ -406,5 +556,6 @@ private:
     Parameters parameters_;
     ProcessedMap processed_map_;
     bool map_ready_{false};
-    Diagnostics diagnostics_;
+    // selectHypotheses가 const 경로에서도 계수를 남깁니다.
+    mutable Diagnostics diagnostics_;
 };

@@ -94,9 +94,48 @@ void ParticleFilter::initializeMultiple(const std::vector<ModeSeed> &seeds) {
     const float uniform_weight = 1.0f / static_cast<float>(count_);
     const std::size_t mode_count = seeds.size();
 
+    // 가중 배분: 각 모드가 받을 파티클 수를 비중에 비례해 정하고, 어떤 모드도
+    // 완전히 굶지 않도록 바닥(전체의 5%)을 보장합니다. 비중이 모두 같으면
+    // 예전 균등 분할과 같습니다.
+    std::vector<int32_t> mode_quota(mode_count, 0);
+    {
+        double weight_total = 0.0;
+        for (const ModeSeed &seed : seeds) {
+            weight_total += std::max(0.0, seed.weight);
+        }
+        const int32_t floor_count = std::max<int32_t>(
+            1, static_cast<int32_t>(0.05 * static_cast<double>(count_)));
+        int32_t assigned = 0;
+        for (std::size_t mode = 0; mode < mode_count; ++mode) {
+            const double share = weight_total > 0.0
+                ? std::max(0.0, seeds[mode].weight) / weight_total
+                : 1.0 / static_cast<double>(mode_count);
+            mode_quota[mode] = std::max(
+                floor_count,
+                static_cast<int32_t>(share * static_cast<double>(count_)));
+            assigned += mode_quota[mode];
+        }
+        // 반올림/바닥 보정으로 총합이 어긋나면 최대 비중 모드에서 조절합니다.
+        const std::size_t dominant = static_cast<std::size_t>(
+            std::max_element(
+                seeds.begin(), seeds.end(),
+                [](const ModeSeed &a, const ModeSeed &b) {
+                    return a.weight < b.weight;
+                }) - seeds.begin());
+        mode_quota[dominant] += count_ - assigned;
+        if (mode_quota[dominant] < 1) {
+            mode_quota[dominant] = 1;
+        }
+    }
+    std::vector<int32_t> mode_used(mode_count, 0);
+    std::size_t cursor = 0;
     for (int32_t index = 0; index < count_; ++index) {
-        // index를 모드 수로 접어 균등 분할합니다(나머지는 앞 모드로).
-        const std::size_t mode = static_cast<std::size_t>(index) % mode_count;
+        while (cursor + 1 < mode_count &&
+               mode_used[cursor] >= mode_quota[cursor]) {
+            ++cursor;
+        }
+        const std::size_t mode = cursor;
+        ++mode_used[mode];
         const ModeSeed &seed = seeds[mode];
         particle &current = particles_[static_cast<std::size_t>(index)];
         current.x = static_cast<float>(seed.x + position_noise(rng_));

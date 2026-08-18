@@ -13,6 +13,7 @@
 
 namespace {
 constexpr double kGravity = 9.80665;
+constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 
 // EKF 구현에서 반복해서 쓰는 작은 수학/시간 보조 함수들입니다.
 double square(double value) {
@@ -144,12 +145,32 @@ void particlePropagation::integrateDeadReckoning(const TimedImu &imu_sample) {
 
     // 속도는 EKF가 휠 측정으로 유지하는 추정치를 씁니다. EKF 갱신 사이에는
     // 상수로 두므로 급가감속 구간에서 mm 수준 오차가 남습니다.
-    const double yaw_rate = imu_sample.msg.angular_velocity.z - ekf_state_(kGyroZBias);
+    const double gyro_z = imu_sample.msg.angular_velocity.z - ekf_state_(kGyroZBias);
     const double velocity = ekf_state_(kVelocity);
+
+    // 기울기 보정. 궤적 버퍼는 2D 지도 평면의 pose이므로, 차가 기울면
+    //   (a) heading rate는 gyro z가 아니다  - IMU z축이 연직이 아니므로
+    //   (b) 이동거리는 v*dt가 아니다        - 경사면 이동을 수평에 투영해야
+    // ZYX 오일러 기구학:
+    //   psi_dot   = (w_y sin(phi) + w_z cos(phi)) / cos(theta)
+    //   ds_horiz  = v cos(theta) dt
+    // theta,phi -> 0에서 기존 평지 식과 정확히 일치합니다.
+    double yaw_rate = gyro_z;
+    double horizontal_velocity = velocity;
+    double tilt_roll = 0.0;
+    double tilt_pitch = 0.0;
+    if (chassisTiltFromImu(imu_sample, tilt_roll, tilt_pitch)) {
+        const double cos_pitch = std::cos(tilt_pitch);
+        // dr_tilt_max_deg로 이미 걸러지므로 cos_pitch는 0에서 충분히 멉니다.
+        yaw_rate = (imu_sample.msg.angular_velocity.y * std::sin(tilt_roll) +
+                    gyro_z * std::cos(tilt_roll)) / cos_pitch;
+        horizontal_velocity = velocity * cos_pitch;
+    }
+
     // 중점(midpoint) 적분이라 선회 중에도 1차 오차가 상쇄됩니다.
     const double mid_yaw = dead_reckoning_yaw_ + 0.5 * yaw_rate * dt;
-    dead_reckoning_x_ += velocity * dt * std::cos(mid_yaw);
-    dead_reckoning_y_ += velocity * dt * std::sin(mid_yaw);
+    dead_reckoning_x_ += horizontal_velocity * dt * std::cos(mid_yaw);
+    dead_reckoning_y_ += horizontal_velocity * dt * std::sin(mid_yaw);
     dead_reckoning_yaw_ = normalizeAngle(dead_reckoning_yaw_ + yaw_rate * dt);
     dead_reckoning_time_ = stamp;
 
@@ -589,6 +610,7 @@ void particlePropagation::setEkfParameters(EkfParameters params) {
     params.gravity_wheel_velocity_sigma =
         std::max(std::abs(params.gravity_wheel_velocity_sigma), 1.0e-12);
     params.accel_gravity_sign = params.accel_gravity_sign >= 0.0 ? 1.0 : -1.0;
+    params.dr_tilt_max_deg = std::clamp(params.dr_tilt_max_deg, 1.0, 80.0);
     ekf_params_ = params;
 }
 
@@ -1399,11 +1421,82 @@ void particlePropagation::applyGravityCalibration(
         ekf_state_(kPitchRate) = 0.0;
         ekf_state_(kRoll) = 0.0;
         ekf_state_(kRollRate) = 0.0;
+        // 경량 DR의 기울기 기준도 같은 순간으로 맞춥니다.
+        if (dr_tilt_reference_valid_) {
+            dr_tilt_reference_roll_ = last_dr_tilt_roll_;
+            dr_tilt_reference_pitch_ = last_dr_tilt_pitch_;
+        }
     }
     // 정지 상태에서 잰 자이로 z 평균을 yaw-rate bias로 확정합니다.
     if (ekf_initialized_) {
         ekf_state_(kGyroZBias) = estimate.gyro_z_bias;
     }
+}
+
+// IMU AHRS quaternion에서 차대 기울기를 뽑습니다.
+//
+// AHRS는 중력 기준 절대 자세를 주지만 우리가 원하는 것은 "노면에 대한 차대의
+// 기울기"이므로, IMU 장착 기울기를 빼야 합니다. 시동 시점 자세를 기준으로
+// 잡아 그 대비 증분을 씁니다(평지에서 시동한다는 전제 - 시작 중력 보정과
+// 같은 전제입니다). 기준은 중력 보정이 확정될 때 다시 맞춥니다.
+bool particlePropagation::chassisTiltFromImu(
+    const TimedImu &imu_sample, double &roll, double &pitch) {
+    last_dr_tilt_valid_ = false;
+    if (!ekf_params_.dr_use_imu_tilt) {
+        return false;
+    }
+
+    const auto &q = imu_sample.msg.orientation;
+    const double norm_sq = q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z;
+    // 자세를 주지 않는 IMU는 quaternion을 0으로 채워 보냅니다.
+    if (!std::isfinite(norm_sq) || norm_sq < 0.5) {
+        return false;
+    }
+    const double inv = 1.0 / std::sqrt(norm_sq);
+    const double qw = q.w * inv;
+    const double qx = q.x * inv;
+    const double qy = q.y * inv;
+    const double qz = q.z * inv;
+
+    const double abs_roll = std::atan2(
+        2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy));
+    const double abs_pitch =
+        std::asin(std::clamp(2.0 * (qw * qy - qz * qx), -1.0, 1.0));
+    if (!std::isfinite(abs_roll) || !std::isfinite(abs_pitch)) {
+        return false;
+    }
+
+    last_dr_tilt_roll_ = abs_roll;
+    last_dr_tilt_pitch_ = abs_pitch;
+    if (!dr_tilt_reference_valid_) {
+        dr_tilt_reference_roll_ = abs_roll;
+        dr_tilt_reference_pitch_ = abs_pitch;
+        dr_tilt_reference_valid_ = true;
+        return false;
+    }
+
+    const double rel_roll = normalizeAngle(abs_roll - dr_tilt_reference_roll_);
+    const double rel_pitch = normalizeAngle(abs_pitch - dr_tilt_reference_pitch_);
+    const double limit = ekf_params_.dr_tilt_max_deg * kDegToRad;
+    if (std::abs(rel_roll) > limit || std::abs(rel_pitch) > limit) {
+        return false;
+    }
+
+    roll = rel_roll;
+    pitch = rel_pitch;
+    last_dr_tilt_valid_ = true;
+    return true;
+}
+
+double particlePropagation::relativeTiltDeg() const {
+    if (!dr_tilt_reference_valid_) {
+        return 0.0;
+    }
+    const double rel_roll =
+        normalizeAngle(last_dr_tilt_roll_ - dr_tilt_reference_roll_);
+    const double rel_pitch =
+        normalizeAngle(last_dr_tilt_pitch_ - dr_tilt_reference_pitch_);
+    return std::max(std::abs(rel_roll), std::abs(rel_pitch)) / kDegToRad;
 }
 
 // 정적 시작 중력값과 동적 pitch/roll 중력 성분을 합칩니다.

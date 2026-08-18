@@ -13,11 +13,25 @@ pose 출력은 매끄럽고 높은 주기를 유지합니다.
 1. **파티클 필터** (스캔 주기, ~40 Hz) — 휠+IMU EKF odometry, 모션 왜곡 보정
    (deskew), sharp/wide 혼합 커널 likelihood-field 스캔 채점, AMCL 방식의 동적
    beam skipping, 관측성 기반(이방성) 스캔–휠 융합.
-2. **Relocalization** (~1 Hz, 위치 상실 감지 시) — **상대주축 인덱스(relative
-   principal-axis index)** 기반 전역 위치추정: 셀별로 미리 계산한 축 맵으로
-   heading 후보를 해석적으로 pruning한 뒤 range matching, non-maximum
+2. **Relocalization** (위치 상실 감지 시, 워커 스레드) — **상대주축 인덱스
+   (relative principal-axis index)** 기반 전역 위치추정: 셀별로 미리 계산한 축
+   맵으로 heading 후보를 해석적으로 pruning한 뒤 range matching, non-maximum
    suppression, 다중 가설 출력, 그리고 검증 게이트를 통과한 가설만 필터에
-   시드합니다.
+   시드합니다. 탐색 자체는 별도 스레드에서 돌아 스캔 주기를 막지 않습니다.
+   잘못된 위치에 시드하는 것이 시드하지 않는 것보다 나쁘므로, 채택 경로에는
+   네 겹의 방어가 있습니다:
+   - **탐색 전제조건** — 유효 빔 비율·차체 기울기·직전 스캔과의 일관성이
+     모두 만족될 때만 전역 탐색을 시작합니다(넘어지거나 가려진 순간의 스캔으로
+     탐색하지 않음).
+   - **부호 인식 검증** — 관측 거리와 예측 거리의 차를 부호로 나눠 봅니다.
+     짧게 나오는 것은 가림(occlusion)이라 벌하지 않고, **길게 나오는 것
+     (see-through)** 만 오정합의 증거로 셉니다. 각도 양자화를 흡수하도록
+     인접 빈의 min/max 대역을 씁니다.
+   - **절대 RMS 게이트** — 후보들 사이의 상대 점수뿐 아니라 절대 잔차 상한을
+     둬서, "다 같이 나쁜" 후보군에서 1등이 뽑히는 것을 막습니다.
+   - **이력 가중 다수결** — 최신 스캔 하나가 아니라 이동 이력(위치/각도 간격으로
+     솎은 과거 스캔들)에서 각 가설을 재채점하고, 지지 비율이 낮으면 기각하거나
+     적은 파티클로 보호관찰(probation) 시드합니다.
 3. **출력 odom estimator** (100 Hz, read-only) — EKF 궤적 버퍼를 보간하고 최신
    `map → odom`을 합성. 스캔/relocalization 지연과 독립적으로 동작합니다.
 
@@ -31,7 +45,8 @@ pose 출력은 매끄럽고 높은 주기를 유지합니다.
 - **`vesc_msgs`** — 플랫폼에서 쓰는 VESC 메시지 패키지로,
   [`rcv-formula/f1_stack_for_damvi`](https://github.com/rcv-formula/f1_stack_for_damvi)
   의 `vesc/vesc_msgs`에서 가져옵니다. 노드는 `vesc_msgs/VescStateStamped`를 구독해
-  `state.displacement`(휠 타코미터)를 읽습니다.
+  기본적으로 `state.speed`(ERPM)를 읽습니다(`ekf.wheel_use_displacement: true`로
+  두면 `state.displacement` 타코미터 경로).
 
 둘 다 `scripts/setup.sh`가 자동으로 받아옵니다 — 아래 참고.
 

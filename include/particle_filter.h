@@ -66,6 +66,10 @@ public:
         double x{0.0};
         double y{0.0};
         double yaw{0.0};
+        // 이 모드에 배분할 파티클 질량의 상대 비중. 증거가 애매한 후보를
+        // 거부하는 대신 적은 질량으로 심어 주행이 판별하게 하는 데 씁니다
+        // (보호관찰). 모두 같으면 예전처럼 균등 분할입니다.
+        double weight{1.0};
     };
     void initializeMultiple(const std::vector<ModeSeed> &seeds);
 

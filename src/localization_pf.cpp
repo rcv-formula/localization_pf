@@ -213,12 +213,35 @@ void mainNode::declareParameters() {
     "relocalization.hypothesis_min_separation_m", 0.8);
   relocalization_parameters_.hypothesis_min_separation_deg = this->declare_parameter<double>(
     "relocalization.hypothesis_min_separation_deg", 25.0);
+  relocalization_parameters_.hypothesis_max_rms_m = this->declare_parameter<double>(
+    "relocalization.hypothesis_max_rms_m", 1.0);
   relocalization_parameters_.hypothesis_verify_fraction = std::clamp(
     this->declare_parameter<double>(
       "relocalization.hypothesis_verify_fraction", 0.7), 0.0, 1.0);
   relocalization_parameters_.hypothesis_verify_inlier_m = std::max(0.05,
     this->declare_parameter<double>(
       "relocalization.hypothesis_verify_inlier_m", 0.2));
+  relocalization_parameters_.verify_signed_gate = this->declare_parameter<bool>(
+    "relocalization.verify_signed_gate", false);
+  relocalization_parameters_.verify_occlusion_m = std::max(0.05,
+    this->declare_parameter<double>("relocalization.verify_occlusion_m", 0.2));
+  relocalization_parameters_.verify_see_through_m = std::max(0.05,
+    this->declare_parameter<double>("relocalization.verify_see_through_m", 0.25));
+  relocalization_parameters_.verify_see_through_max = std::clamp(
+    this->declare_parameter<double>("relocalization.verify_see_through_max", 0.10),
+    0.0, 1.0);
+  relocalization_parameters_.verify_visible_fraction = std::clamp(
+    this->declare_parameter<double>("relocalization.verify_visible_fraction", 0.8),
+    0.0, 1.0);
+  relocalization_parameters_.verify_min_visible_frac = std::clamp(
+    this->declare_parameter<double>("relocalization.verify_min_visible_frac", 0.40),
+    0.0, 1.0);
+  relocalization_parameters_.verify_min_sector_beams =
+    static_cast<std::size_t>(std::max<int>(1, this->declare_parameter<int>(
+      "relocalization.verify_min_sector_beams", 15)));
+  relocalization_parameters_.verify_min_visible_sectors =
+    static_cast<std::size_t>(std::max<int>(0, this->declare_parameter<int>(
+      "relocalization.verify_min_visible_sectors", 4)));
   relocalization_parameters_.normal_chord_m = this->declare_parameter<double>(
     "relocalization.normal_chord_m", 0.30);
   relocalization_parameters_.normal_max_half_window = std::max<int>(
@@ -233,6 +256,38 @@ void mainNode::declareParameters() {
     "relocalization.fine_position_radius_m", 0.30);
   relocalization_parameters_.top_candidates = static_cast<std::size_t>(
     std::max<int>(1, this->declare_parameter<int>("relocalization.top_candidates", 24)));
+  relocalize_retry_period_s_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.empty_retry_period_s", relocalize_retry_period_s_));
+  reloc_scan_change_m_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.scan_change_trigger_m", reloc_scan_change_m_));
+  flip_clause_enabled_ = this->declare_parameter<bool>(
+    "relocalization.flip_clause_enabled", true);
+  flip_clause_deg_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.flip_clause_deg", 90.0));
+  flip_majority_fraction_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.flip_majority_fraction", 0.7), 0.0, 1.0);
+  flip_max_see_through_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.flip_max_see_through", 0.10), 0.0, 1.0);
+  majority_band_enabled_ = this->declare_parameter<bool>(
+    "relocalization.majority_band_enabled", false);
+  majority_accept_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.majority_accept", 0.60), 0.0, 1.0);
+  majority_probation_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.majority_probation", 0.25), 0.0, 1.0);
+  probation_mass_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.probation_mass", 0.3), 0.01, 1.0);
+  majority_escape_s_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.majority_escape_s", 5.0));
+  search_min_valid_ratio_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.search_min_valid_ratio", 0.6), 0.0, 1.0);
+  search_max_tilt_deg_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.search_max_tilt_deg", 15.0));
+  search_consistency_inlier_m_ = std::max(0.01, this->declare_parameter<double>(
+    "relocalization.search_consistency_inlier_m", 0.2));
+  search_consistency_fraction_ = std::clamp(this->declare_parameter<double>(
+    "relocalization.search_consistency_fraction", 0.8), 0.0, 1.0);
+  search_consistency_frames_ = std::max(1, static_cast<int>(
+    this->declare_parameter<int>("relocalization.search_consistency_frames", 3)));
   relocalize_period_s_ = this->declare_parameter<double>(
     "relocalization.retry_period_s", 1.0);
 
@@ -267,6 +322,10 @@ void mainNode::declareParameters() {
     "tracking.converge_distance_m", 1.0));
   converge_rotation_deg_ = std::max(0.0, this->declare_parameter<double>(
     "tracking.converge_rotation_deg", 90.0));
+  converge_use_observability_ = this->declare_parameter<bool>(
+    "tracking.converge_use_observability", false);
+  converge_raw_cap_factor_ = std::max(1.0, this->declare_parameter<double>(
+    "tracking.converge_raw_cap_factor", 3.0));
   score_fail_threshold_ = this->declare_parameter<double>(
     "tracking.score_fail_threshold", -9.0);
   multi_scan_count_ = std::max<int>(2, this->declare_parameter<int>(
@@ -275,6 +334,37 @@ void mainNode::declareParameters() {
     "relocalization.multi_scan_spacing_m", 0.5));
   multi_scan_spacing_deg_ = std::max(1.0, this->declare_parameter<double>(
     "relocalization.multi_scan_spacing_deg", 15.0));
+  relocalization_parameters_.history_support_fraction = std::clamp(
+    this->declare_parameter<double>(
+      "relocalization.history_support_fraction", 0.6), 0.0, 1.0);
+  relocalization_parameters_.history_valid_dr_max_m = std::max(0.0,
+    this->declare_parameter<double>(
+      "relocalization.history_valid_dr_max_m", 4.0));
+  relocalization_parameters_.history_min_visible_frac = std::clamp(
+    this->declare_parameter<double>(
+      "relocalization.history_min_visible_frac", 0.5), 0.0, 1.0);
+  relocalization_parameters_.history_majority_gate = this->declare_parameter<bool>(
+    "relocalization.history_majority_gate", false);
+  relocalization_parameters_.history_pass_ratio = std::max(1.0,
+    this->declare_parameter<double>("relocalization.history_pass_ratio", 1.5));
+  relocalization_parameters_.history_pass_slack_m = std::max(0.0,
+    this->declare_parameter<double>("relocalization.history_pass_slack_m", 0.3));
+  relocalization_parameters_.history_view_useless_m = std::max(0.0,
+    this->declare_parameter<double>("relocalization.history_view_useless_m", 1.5));
+  relocalization_parameters_.history_weight_low_f = std::clamp(
+    this->declare_parameter<double>("relocalization.history_weight_low_f", 0.3),
+    0.0, 1.0);
+  relocalization_parameters_.history_weight_high_f = std::clamp(
+    this->declare_parameter<double>("relocalization.history_weight_high_f", 0.7),
+    0.0, 1.0);
+  relocalization_parameters_.history_majority_fraction = std::clamp(
+    this->declare_parameter<double>(
+      "relocalization.history_majority_fraction", 0.5), 0.0, 1.0);
+  relocalization_parameters_.history_min_support_weight = std::max(0.0,
+    this->declare_parameter<double>(
+      "relocalization.history_min_support_weight", 2.0));
+  relocalization_parameters_.history_new_aggregate = this->declare_parameter<bool>(
+    "relocalization.history_new_aggregate", false);
   relocalization_parameters_.multi_scan_top_candidates = static_cast<std::size_t>(
     std::max<int>(4, this->declare_parameter<int>(
       "relocalization.multi_scan_top_candidates", 64)));
@@ -302,6 +392,17 @@ void mainNode::declareParameters() {
     "scoring.beam_skip_particle_stride", beam_skip_particle_stride_));
   beamskip_lost_fraction_ = std::clamp(this->declare_parameter<double>(
     "tracking.beamskip_lost_fraction", beamskip_lost_fraction_), 0.0, 1.0);
+  dynamic_skip_reject_ = this->declare_parameter<bool>(
+    "tracking.dynamic_skip_reject", dynamic_skip_reject_);
+  dynamic_skip_speed_mps_ = std::max(0.0, this->declare_parameter<double>(
+    "tracking.dynamic_skip_speed_mps", dynamic_skip_speed_mps_));
+  dynamic_skip_ego_ratio_ = std::max(0.0, this->declare_parameter<double>(
+    "tracking.dynamic_skip_ego_ratio", dynamic_skip_ego_ratio_));
+  dynamic_skip_min_samples_ = std::max(2, static_cast<int>(
+    this->declare_parameter<int>(
+      "tracking.dynamic_skip_min_samples", dynamic_skip_min_samples_)));
+  dynamic_skip_min_dt_ = std::max(0.0, this->declare_parameter<double>(
+    "tracking.dynamic_skip_min_dt", dynamic_skip_min_dt_));
   beamskip_lost_window_ = std::max<int>(1, this->declare_parameter<int>(
     "tracking.beamskip_lost_window", beamskip_lost_window_));
   beamskip_lost_count_ = std::max<int>(1, this->declare_parameter<int>(
@@ -358,6 +459,10 @@ void mainNode::declareParameters() {
   ekf_parameters_.lateral_accel_variance = this->declare_parameter<double>(
     "ekf.lateral_accel_variance", 0.35 * 0.35);
   ekf_parameters_.slip_gain = this->declare_parameter<double>("ekf.slip_gain", 20.0);
+  ekf_parameters_.dr_use_imu_tilt = this->declare_parameter<bool>(
+    "ekf.dr_use_imu_tilt", true);
+  ekf_parameters_.dr_tilt_max_deg = this->declare_parameter<double>(
+    "ekf.dr_tilt_max_deg", 45.0);
   ekf_parameters_.enable_startup_gravity_calibration = this->declare_parameter<bool>(
     "ekf.enable_startup_gravity_calibration", true);
   ekf_parameters_.gravity_calibration_path = this->declare_parameter<std::string>(
@@ -456,6 +561,10 @@ void mainNode::map_callback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {
 }
 
 bool mainNode::setupMap(const nav_msgs::msg::OccupancyGrid &grid) {
+  // relocalization_ 의 맵을 갈아끼우기 전에 워커가 그것을 쓰고 있지
+  // 않은지 보장해야 합니다.
+  waitForRelocalizationWorker();
+
   map_ = grid;
 
   try {
@@ -745,21 +854,62 @@ void mainNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
 
   // Lost 중에도 주행이 이어지므로 히스토리는 상태와 무관하게 쌓습니다.
   updateScanHistory(*msg);
+  // 자기일관성은 상태와 무관하게 매 스캔 갱신해야 붕괴 직후 첫 검사가
+  // 의미를 갖습니다.
+  updateScanConsistency(*msg);
 
   if (state_ == LocalizationState::Lost) {
-    // 전역 탐색은 수백 ms가 걸리므로 매 scan마다 시도하지 않습니다.
+    // 워커가 돌고 있으면 결과만 확인하고 즉시 반환합니다. 탐색이 콜백을
+    // 막지 않으므로 100 Hz 출력 타이머는 그동안에도 정상 동작합니다.
+    if (reloc_in_flight_) {
+      if (harvestRelocalization()) {
+        // 정지 한 스캔의 최적해는 복도 앨리어스일 수 있으므로 바로 확정하지
+        // 않고, 주행으로 가설이 판별될 때까지 Converging에 머뭅니다.
+        setState(LocalizationState::Converging);
+        announceReloc("RELOC: global search", 0.15f, 0.75f, 0.30f);
+        RCLCPP_INFO(this->get_logger(), "Global localization seeded. Converging.");
+      }
+      return;
+    }
+
+    // 전역 탐색은 수백 ms가 걸리므로 매 scan마다 시도하지 않습니다. 다만
+    // 직전 시도가 빈손이었다면 짧은 주기로 재시도합니다 — 실패가 반복되는
+    // 구간은 대개 입력이 나쁜 구간이라, 입력이 좋아지는 순간을 놓치지 않는
+    // 것이 중요합니다(실측 icra: 1초 주기로는 회복이 17초 지연).
+    //
+    // 그리고 장면이 확실히 바뀌면 주기를 기다리지 않고 바로 시도합니다.
+    // 새 관측이 들어왔다는 뜻이므로 이전 실패가 근거가 되지 않습니다.
     const rclcpp::Time now = this->now();
-    if ((now - last_relocalize_attempt_).seconds() < relocalize_period_s_) {
+    const double period = reloc_last_empty_ ?
+      relocalize_retry_period_s_ : relocalize_period_s_;
+    const double scan_change = scanChangeMetric(*msg);
+    const bool scene_changed = scan_change > reloc_scan_change_m_;
+    if (!scene_changed &&
+        (now - last_relocalize_attempt_).seconds() < period) {
+      return;
+    }
+    // 관측이 신뢰할 만해질 때까지 탐색 자체를 멈춘다. 이게 없으면 반쯤
+    // 눈먼 스캔으로 13만 후보를 훑어 앨리어스에 시드하고, 게이트는 그
+    // 스캔만 보므로 막지 못한다.
+    std::string block_reason;
+    if (!searchPreconditionsMet(*msg, block_reason)) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "global search held: %s", block_reason.c_str());
       return;
     }
     last_relocalize_attempt_ = now;
-    if (tryRelocalize(*msg)) {
-      // 정지 한 스캔의 최적해는 복도 앨리어스일 수 있으므로 바로 확정하지
-      // 않고, 주행으로 가설이 판별될 때까지 Converging에 머뭅니다.
-      setState(LocalizationState::Converging);
-      announceReloc("RELOC: global search", 0.15f, 0.75f, 0.30f);
-      RCLCPP_INFO(this->get_logger(), "Global localization seeded. Converging.");
-    }
+    reloc_attempt_signature_ = scanSignature(*msg);
+    // 입력 스냅샷은 메인 스레드에서 만듭니다(propagation_/이력 접근).
+    // 탐색 본체만 워커로 보냅니다.
+    auto request = std::make_shared<GlobalSearchRequest>(
+      buildGlobalSearchRequest(*msg));
+    reloc_anchor_valid_ = currentLaserDrPose(
+      reloc_anchor_x_, reloc_anchor_y_, reloc_anchor_yaw_);
+    reloc_future_ = std::async(
+      std::launch::async,
+      [this, request]() { return executeGlobalSearch(*request); });
+    reloc_in_flight_ = true;
     return;
   }
 
@@ -777,45 +927,349 @@ void mainNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
     arrival_delay_ms, processing_ms,
     latency_processing_ms_ / std::max(1, latency_samples_),
     latency_max_processing_ms_, latency_samples_);
+
 }
 
-bool mainNode::tryRelocalize(const sensor_msgs::msg::LaserScan &scan) {
+mainNode::~mainNode() {
+  waitForRelocalizationWorker();
+}
+
+// 워커가 돌고 있으면 끝날 때까지 막습니다. relocalization_ 을 워커와
+// 동시에 만지면 안 되는 지점(맵 교체, 노드 종료)에서만 호출합니다.
+void mainNode::waitForRelocalizationWorker() {
+  if (!reloc_in_flight_) {
+    return;
+  }
+  if (reloc_future_.valid()) {
+    reloc_future_.wait();
+    try {
+      reloc_future_.get();
+    } catch (const std::exception &) {
+      // 결과를 버리는 경로이므로 예외도 삼킵니다.
+    }
+  }
+  reloc_in_flight_ = false;
+}
+
+// 워커 결과를 수확해 필터에 시드합니다. 아직 안 끝났으면 false.
+bool mainNode::harvestRelocalization() {
+  if (!reloc_in_flight_ || !reloc_future_.valid()) {
+    return false;
+  }
+  if (reloc_future_.wait_for(std::chrono::seconds(0)) !=
+      std::future_status::ready) {
+    return false;
+  }
+
+  GlobalSearchResult result;
   try {
-    // EKF를 스캔 시각까지 진행시켜 이후 추적이 같은 기준에서 시작하게 합니다.
-    propagation_->advanceTo(scan.header.stamp);
-
-    const auto hypotheses = runGlobalSearch(scan);
-    if (hypotheses.empty()) {
-      RCLCPP_INFO_THROTTLE(
-        this->get_logger(), *this->get_clock(), 2000,
-        "global search: no hypotheses");
-      return false;
-    }
-    std::vector<ParticleFilter::ModeSeed> seeds;
-    seeds.reserve(hypotheses.size());
-    for (std::size_t index = 0; index < hypotheses.size(); ++index) {
-      const auto &h = hypotheses[index];
-      seeds.push_back(ParticleFilter::ModeSeed{h.x, h.y, h.yaw});
-      RCLCPP_INFO(
-        this->get_logger(), "reloc hypo[%zu](%.2f,%.2f,%.1f) score=%.4f%s",
-        index, h.x, h.y, h.yaw * 180.0 / kPi, h.score,
-        index == 0 ? " <- dominant seed" : "");
-    }
-    RCLCPP_INFO(
-      this->get_logger(), "reloc %zu hypotheses, pts=%zu",
-      hypotheses.size(), relocalization_->lastDiagnostics().scan_points);
-
-    seedFilter(seeds);
-    return true;
+    result = reloc_future_.get();
   } catch (const std::exception &error) {
     RCLCPP_WARN_THROTTLE(
       this->get_logger(), *this->get_clock(), 5000,
-      "Relocalization failed: %s", error.what());
+      "Relocalization worker threw: %s", error.what());
+    reloc_in_flight_ = false;
+    reloc_last_empty_ = true;
     return false;
   }
+  reloc_in_flight_ = false;
+
+  if (!result.error.empty()) {
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "Relocalization failed: %s", result.error.c_str());
+  }
+  if (result.hypotheses.empty()) {
+    // best_score(-MSE)를 함께 남긴다. 후보가 아예 없었는지, 있었지만 품질
+    // 게이트에 걸렸는지를 구분해야 임계를 판단할 수 있다.
+    const auto &diag = relocalization_->lastDiagnostics();
+    const double best = diag.best_score;
+    // 어느 단계에서 걸렸는지까지 남깁니다. "후보가 없다"와 "후보는 있는데
+    // 게이트가 막았다"는 완전히 다른 문제입니다.
+    RCLCPP_INFO(
+      this->get_logger(),
+      "global search: no hypotheses | best %.3f (RMS %.2f m, gate %.2f m) "
+      "inlier best %.2f (gate %.2f) | pool %zu: score_floor %zu, dup %zu, "
+      "verify %zu(inl %zu/see %zu/cov %zu), ok %zu | scans %zu pts %zu"
+      " | top: vis %u/%u occl %u inl %.2f see %.2f sect %u visRMS %.2f fail 0x%02x",
+      best, best < 0.0 ? std::sqrt(-best) : 0.0,
+      relocalization_parameters_.hypothesis_max_rms_m,
+      diag.best_inlier, relocalization_parameters_.hypothesis_verify_fraction,
+      diag.pool_size, diag.rejected_score_floor, diag.absorbed_duplicate,
+      diag.rejected_verify, diag.rejected_verify_inlier,
+      diag.rejected_verify_seethrough, diag.rejected_verify_coverage,
+      diag.accepted,
+      scan_history_.size() + 1, diag.scan_points,
+      static_cast<unsigned>(diag.best_verify.total - diag.best_verify.occluded),
+      static_cast<unsigned>(diag.best_verify.total),
+      static_cast<unsigned>(diag.best_verify.occluded),
+      diag.best_verify.visible_inlier_frac, diag.best_verify.see_through_frac,
+      static_cast<unsigned>(diag.best_verify.visible_sectors),
+      diag.best_verify.visible_rms,
+      static_cast<unsigned>(diag.best_verify.fail_mask));
+
+    // 다음 시도는 짧은 주기로 — 입력이 좋아지는 순간을 놓치지 않기 위해.
+    reloc_last_empty_ = true;
+    return false;
+  }
+  reloc_last_empty_ = false;
+
+  if (result.from_trajectory) {
+    RCLCPP_INFO(
+      this->get_logger(),
+      "trajectory fit: %zu hypotheses over %.1f m / %.0f deg, "
+      "top(%.2f,%.2f,%.1f) joint=%.4f",
+      result.hypotheses.size(), result.trajectory_distance,
+      result.trajectory_rotation * 180.0 / kPi,
+      result.hypotheses.front().x, result.hypotheses.front().y,
+      result.hypotheses.front().yaw * 180.0 / kPi,
+      result.hypotheses.front().score);
+  }
+
+  // 탐색이 도는 동안 차가 움직인 만큼을 가설에 합성합니다. 가설은 탐색을
+  // 시작한 scan 시각의 pose이고, 시드는 지금 적용되기 때문입니다.
+  double lead_x = 0.0;
+  double lead_y = 0.0;
+  double lead_yaw = 0.0;
+  double now_x = 0.0;
+  double now_y = 0.0;
+  double now_yaw = 0.0;
+  if (reloc_anchor_valid_ && currentLaserDrPose(now_x, now_y, now_yaw)) {
+    const double dx = now_x - reloc_anchor_x_;
+    const double dy = now_y - reloc_anchor_y_;
+    const double cos_ref = std::cos(-reloc_anchor_yaw_);
+    const double sin_ref = std::sin(-reloc_anchor_yaw_);
+    lead_x = cos_ref * dx - sin_ref * dy;
+    lead_y = sin_ref * dx + cos_ref * dy;
+    lead_yaw = normalizeAngle(now_yaw - reloc_anchor_yaw_);
+  }
+  reloc_anchor_valid_ = false;
+  RCLCPP_INFO(
+    this->get_logger(),
+    "reloc search %.0f ms, lead(%.3f,%.3f,%.1f deg) applied to seeds",
+    result.elapsed_ms, lead_x, lead_y, lead_yaw * 180.0 / kPi);
+
+  // ---- 플립 조항 ----
+  //
+  // prior와 90도 넘게 다른 시드는 비범한 주장이라 비범한 증거를 요구한다.
+  // 차단이 아니라 기준 상향만 한다 — 이전 시드가 플립이라 prior가 뒤집혀
+  // 있고 새 후보가 교정인 경우, 교정 후보는 건강한 이력 지지를 갖고 있어
+  // 상향된 기준을 통과한다. 조항이 교정을 막는 경로는 없다.
+  //
+  // IMU 자세 이벤트(전복/들림)가 있었던 에피소드는 면제한다 — heading
+  // prior가 정당하게 무효이기 때문이다.
+  // 밴드와 플립 조항의 적용 조건은 다르다.
+  //   밴드: prior를 쓰지 않는다(이력 지지율만 본다). 주행 중 Lost면 적용.
+  //   플립: prior heading과 비교하므로, IMU 자세 이벤트가 있으면 heading
+  //         prior가 정당하게 무효라 면제한다.
+  // 이 둘을 하나로 묶으면 전복 에피소드에서 밴드까지 꺼진다(실측: icra
+  // seed2가 지지율 0.00인데도 시드됨).
+  const bool band_applicable = majority_band_enabled_ && lost_anchor_valid_;
+  double prior_yaw = 0.0;
+  bool prior_valid = false;
+  if (flip_clause_enabled_ && !lost_imu_event_ && lost_anchor_valid_) {
+    double dr_x2 = 0.0;
+    double dr_y2 = 0.0;
+    double dr_yaw2 = 0.0;
+    if (currentLaserDrPose(dr_x2, dr_y2, dr_yaw2)) {
+      prior_yaw = normalizeAngle(
+        lost_fused_yaw_ + normalizeAngle(dr_yaw2 - lost_dr_yaw_));
+      prior_valid = true;
+    }
+  }
+
+  std::vector<ParticleFilter::ModeSeed> seeds;
+  seeds.reserve(result.hypotheses.size());
+  for (std::size_t index = 0; index < result.hypotheses.size(); ++index) {
+    const auto &h = result.hypotheses[index];
+    bool flip_triggered = false;
+    if (prior_valid) {
+      const double heading_delta =
+        std::abs(normalizeAngle(h.yaw + lead_yaw - prior_yaw)) * 180.0 / kPi;
+      flip_triggered = heading_delta > flip_clause_deg_;
+      if (flip_triggered) {
+        const bool thin_evidence =
+          h.support_weight < relocalization_parameters_.history_min_support_weight;
+        // 증거가 얇으면 다수결을 요구할 수 없으므로 latest를 더 엄격히 본다.
+        const bool ok = thin_evidence
+          ? (h.verify.see_through_frac <= flip_max_see_through_)
+          : (h.support_ratio >= flip_majority_fraction_);
+        if (!ok) {
+          RCLCPP_INFO(
+            this->get_logger(),
+            "flip clause: hypo[%zu] heading %.0f deg from prior, "
+            "support %.2f (w %.2f) see %.2f — rejected",
+            index, heading_delta, h.support_ratio, h.support_weight,
+            h.verify.see_through_frac);
+          continue;
+        }
+        RCLCPP_INFO(
+          this->get_logger(),
+          "flip clause: hypo[%zu] heading %.0f deg from prior — passed "
+          "(support %.2f w %.2f, see %.2f)",
+          index, heading_delta, h.support_ratio, h.support_weight,
+          h.verify.see_through_frac);
+      }
+    }
+    // ---- 밴드 판정 ----
+    //
+    // prior가 없으면(스타트업/리셋) 비교 대상이 없으므로 기존 경로 그대로
+    // 전부 시드하고 Converging이 판별한다. prior가 있는 주행 중 Lost에서만
+    // 밴드가 작동한다.
+    double seed_weight = 1.0;
+    if (band_applicable) {
+      const bool thin =
+        h.support_weight < relocalization_parameters_.history_min_support_weight;
+      const double accept = flip_triggered ? flip_majority_fraction_
+                                           : majority_accept_;
+      const double probation = flip_triggered ? 0.30 : majority_probation_;
+      if (thin) {
+        // 증거가 얇으면 다수결을 요구할 수 없다 — 보호관찰로 심어 주행에
+        // 넘긴다(thin-evidence 경쟁 시딩).
+        seed_weight = probation_mass_;
+      } else if (h.support_ratio >= accept) {
+        seed_weight = 1.0;
+      } else if (h.support_ratio >= probation) {
+        seed_weight = probation_mass_;
+        RCLCPP_INFO(
+          this->get_logger(),
+          "majority band: hypo[%zu] support %.2f (w %.2f) — probation",
+          index, h.support_ratio, h.support_weight);
+      } else {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "majority band: hypo[%zu] support %.2f (w %.2f) — rejected",
+          index, h.support_ratio, h.support_weight);
+        continue;
+      }
+    }
+    const double cos_h = std::cos(h.yaw);
+    const double sin_h = std::sin(h.yaw);
+    seeds.push_back(ParticleFilter::ModeSeed{
+      h.x + cos_h * lead_x - sin_h * lead_y,
+      h.y + sin_h * lead_x + cos_h * lead_y,
+      normalizeAngle(h.yaw + lead_yaw),
+      seed_weight});
+    RCLCPP_INFO(
+      this->get_logger(),
+      "reloc hypo[%zu](%.2f,%.2f,%.1f) score=%.4f aggRMS=%.2f | vis %u/%u "
+      "occl %u inl %.2f see %.2f sect %u visRMS %.2f fail 0x%02x "
+      "| support %.2f (w %.2f)%s",
+      index, h.x, h.y, h.yaw * 180.0 / kPi, h.score,
+      h.score < 0.0 ? std::sqrt(-h.score) : 0.0,
+      static_cast<unsigned>(h.verify.total - h.verify.occluded),
+      static_cast<unsigned>(h.verify.total),
+      static_cast<unsigned>(h.verify.occluded),
+      h.verify.visible_inlier_frac, h.verify.see_through_frac,
+      static_cast<unsigned>(h.verify.visible_sectors), h.verify.visible_rms,
+      static_cast<unsigned>(h.verify.fail_mask),
+      h.support_ratio, h.support_weight,
+      index == 0 ? " <- dominant seed" : "");
+    if (h.view_count > 0) {
+      std::string views;
+      for (std::uint8_t v = 0; v < h.view_count; ++v) {
+        views += (v ? " " : "");
+        views += std::to_string(
+          static_cast<int>(std::lround(h.view_rms[v] * 100.0)));
+        views += "/";
+        views += std::to_string(
+          static_cast<int>(std::lround(h.view_visible[v] * 100.0)));
+      }
+      RCLCPP_INFO(
+        this->get_logger(), "  hypo[%zu] views RMScm/vis%%: [%s]",
+        index, views.c_str());
+    }
+  }
+  {
+    // 신·구 집계 점수와 이력별 점수를 함께 남긴다. 같은 후보에 대한 두 점수가
+    // 나란히 찍히므로 섀도 비교와 행1 포렌식(버려진 이력의 점수 분포)이
+    // 추가 런 없이 나온다.
+    const auto &diag = relocalization_->lastDiagnostics();
+    std::string views;
+    for (std::uint8_t i = 0; i < diag.top_view_count; ++i) {
+      views += (i ? " " : "");
+      // "RMS/가시분율" 쌍으로 남긴다 — 가림이 원인인지 판정하려면 둘이 필요.
+      const double rms = diag.top_view_scores[i] < 0.0
+        ? std::sqrt(-diag.top_view_scores[i]) : 0.0;
+      views += std::to_string(static_cast<int>(std::lround(rms * 100.0)));
+      views += "/";
+      views += std::to_string(
+        static_cast<int>(std::lround(diag.top_view_visible[i] * 100.0)));
+    }
+    RCLCPP_INFO(
+      this->get_logger(),
+      "reloc %zu hypotheses, pts=%zu | aggregate old %.4f new %.4f"
+      " | views RMScm/vis%% [%s]",
+      result.hypotheses.size(), result.scan_points,
+      diag.top_score_old, diag.top_score_new, views.c_str());
+  }
+
+  if (seeds.empty() && !result.hypotheses.empty()) {
+    // 전원 거부. Lost 중에는 이력이 동결되므로 다음 시도도 같은 뷰로 같은
+    // 판정을 내려 영원히 거부할 수 있다(데드락). 일정 시간을 넘기면 최선
+    // 후보를 보호관찰로 승격한다 — 반복을 '정답의 증거'로 쓰는 게 아니라
+    // '게이트 교착의 증거'로 써서 주행 판별에 넘기는 것이다.
+    const double lost_elapsed = lost_anchor_valid_
+      ? this->now().seconds() - lost_stamp_ : 0.0;
+    if (lost_elapsed > majority_escape_s_) {
+      const auto &h = result.hypotheses.front();
+      const double cos_h = std::cos(h.yaw);
+      const double sin_h = std::sin(h.yaw);
+      seeds.push_back(ParticleFilter::ModeSeed{
+        h.x + cos_h * lead_x - sin_h * lead_y,
+        h.y + sin_h * lead_x + cos_h * lead_y,
+        normalizeAngle(h.yaw + lead_yaw), probation_mass_});
+      RCLCPP_WARN(
+        this->get_logger(),
+        "majority escape: all rejected for %.1f s — seeding best on probation "
+        "(support %.2f)", lost_elapsed, h.support_ratio);
+    }
+  }
+  if (seeds.empty()) {
+    // 빈 시드로 진행하면 estimation_.reset이 seeds.front()를 건드려 UB다.
+    // 후보 없음과 같게 취급하고 재시도한다.
+    RCLCPP_INFO(
+      this->get_logger(),
+      "all hypotheses rejected — treating as no hypotheses");
+    reloc_last_empty_ = true;
+    return false;
+  }
+  seedFilter(seeds);
+  return true;
 }
 
 void mainNode::seedFilter(const std::vector<ParticleFilter::ModeSeed> &seeds) {
+  // 정전 구간을 통과한 DR 오차: 예측(마지막 정상 pose + 그동안의 DR) 대비
+  // 실제 시드 위치. 로컬 복구 반경을 이 실측으로 정한다.
+  if (lost_anchor_valid_ && !seeds.empty()) {
+    double dr_x = 0.0;
+    double dr_y = 0.0;
+    double dr_yaw = 0.0;
+    if (currentLaserDrPose(dr_x, dr_y, dr_yaw)) {
+      const double delta_x = dr_x - lost_dr_x_;
+      const double delta_y = dr_y - lost_dr_y_;
+      const double cos_ref = std::cos(-lost_dr_yaw_);
+      const double sin_ref = std::sin(-lost_dr_yaw_);
+      const double body_x = cos_ref * delta_x - sin_ref * delta_y;
+      const double body_y = sin_ref * delta_x + cos_ref * delta_y;
+      const double body_yaw = normalizeAngle(dr_yaw - lost_dr_yaw_);
+      const double cos_f = std::cos(lost_fused_yaw_);
+      const double sin_f = std::sin(lost_fused_yaw_);
+      const double predicted_x = lost_fused_x_ + cos_f * body_x - sin_f * body_y;
+      const double predicted_y = lost_fused_y_ + sin_f * body_x + cos_f * body_y;
+      const double predicted_yaw = normalizeAngle(lost_fused_yaw_ + body_yaw);
+      RCLCPP_INFO(
+        this->get_logger(),
+        "outage DR error: predicted(%.2f,%.2f,%.1f) vs seed(%.2f,%.2f,%.1f) "
+        "= %.2f m / %.1f deg over %.1f s (DR travel %.2f m)",
+        predicted_x, predicted_y, predicted_yaw * 180.0 / kPi,
+        seeds.front().x, seeds.front().y, seeds.front().yaw * 180.0 / kPi,
+        std::hypot(predicted_x - seeds.front().x, predicted_y - seeds.front().y),
+        std::abs(normalizeAngle(predicted_yaw - seeds.front().yaw)) * 180.0 / kPi,
+        this->now().seconds() - lost_stamp_, std::hypot(body_x, body_y));
+    }
+    lost_anchor_valid_ = false;
+  }
   filter_.initializeMultiple(seeds);
   // 파티클을 다시 뿌렸으므로 오래된 기준 pose와의 큰 차이를 적용하지 않도록
   // propagation 기준을 반드시 초기화합니다.
@@ -826,9 +1280,16 @@ void mainNode::seedFilter(const std::vector<ParticleFilter::ModeSeed> &seeds) {
   accumulated_rotation_ = 0.0;
   converge_accumulated_ = 0.0;
   converge_rotation_accumulated_ = 0.0;
+  converge_raw_translation_ = 0.0;
+  converge_raw_rotation_ = 0.0;
   map_inconsistency_ema_ = 0.0;
   beamskip_bad_frames_.clear();
   beamskip_bad_count_ = 0;
+  // 중심 창도 함께 비운다. 시드는 pose를 불연속으로 옮기므로, 남겨 두면
+  // 재시드 전후 샘플이 한 창에 섞여 점프가 물체 운동으로 계산된다.
+  // 가설이 1개면 시드 직후 alive==1이라 감시가 곧바로 무장되어 무장 해제
+  // 경로로는 비워지지 않는다(icra 실측: 에고 26.5 m/s 같은 허수).
+  beamskip_centroids_.clear();
   scan_particles_.clear();
   // 융합 기준을 seeds[0]으로 잡았으므로 지배 모드 추적도 0에서 시작합니다.
   last_dominant_mode_ = 0;
@@ -867,6 +1328,30 @@ void mainNode::updateScanHistory(const sensor_msgs::msg::LaserScan &scan) {
     }
   }
 
+  // 오염된 스냅샷은 애초에 넣지 않습니다.
+  //
+  // multi-scan 공동 채점은 '모든' 스캔이 맞아야 통과하므로, 한 장만 오염돼도
+  // 모든 후보가 떨어집니다. 그런데 이력은 0.5 m/15도마다 한 장씩만 갱신되어
+  // 최대 5.5 m를 달려야 씻겨나갑니다. 실측 icra: 50초경 전복 후 리로컬이
+  // 17초 동안 계속 실패하다가 이력이 교체되고 나서야 98 ms 만에 성공했습니다
+  // (탐색이 느린 게 아니라 입력이 오염돼 있었습니다).
+  //
+  // (1) 전복/들림: 라이다 평면이 기울어 바닥·천장을 봅니다. 같은 구간에서
+  //     DR도 끊기므로 상대이동 사슬까지 함께 깨집니다.
+  if (propagation_->relativeTiltDeg() > ekf_parameters_.dr_tilt_max_deg) {
+    return;
+  }
+  // (2) 유의미한 점을 못 얻은 스캔: 전역 탐색이 어차피 쓰지 못합니다.
+  std::size_t valid_points = 0;
+  for (const float range : scan.ranges) {
+    if (std::isfinite(range) && range >= scan.range_min && range <= scan.range_max) {
+      ++valid_points;
+    }
+  }
+  if (valid_points < relocalization_parameters_.minimum_scan_points) {
+    return;
+  }
+
   if (!scan_history_.empty()) {
     const ScanSnapshot &last = scan_history_.back();
     const double distance = std::hypot(snapshot.x - last.x, snapshot.y - last.y);
@@ -885,8 +1370,171 @@ void mainNode::updateScanHistory(const sensor_msgs::msg::LaserScan &scan) {
   }
 }
 
-std::vector<Relocalization::Hypothesis> mainNode::runGlobalSearch(
+// EKF 최신 시각의 라이다 pose(파티클과 같은 프레임)를 돌려줍니다.
+bool mainNode::currentLaserDrPose(double &x, double &y, double &yaw) const {
+  if (!propagation_) {
+    return false;
+  }
+  const auto sample = propagation_->poseAt(propagation_->newestTrajectoryTime());
+  if (!sample.valid) {
+    return false;
+  }
+  const double cos_yaw = std::cos(sample.yaw);
+  const double sin_yaw = std::sin(sample.yaw);
+  x = sample.x +
+    cos_yaw * laser_extrinsic_.rear_to_laser_x -
+    sin_yaw * laser_extrinsic_.rear_to_laser_y;
+  y = sample.y +
+    sin_yaw * laser_extrinsic_.rear_to_laser_x +
+    cos_yaw * laser_extrinsic_.rear_to_laser_y;
+  yaw = sample.yaw;
+  return true;
+}
+
+bool mainNode::searchPreconditionsMet(
+  const sensor_msgs::msg::LaserScan &scan, std::string &reason) {
+  // (1) 유효점 비율 — 센서 수준 이상(틸트로 하늘/바닥을 봄, max-range 폭증).
+  //     가림은 짧은 리턴이라 유효점을 줄이지 않으므로 정상 가림 씬과 충돌하지
+  //     않는다.
+  std::size_t valid = 0;
+  for (const float range : scan.ranges) {
+    if (std::isfinite(range) && range >= scan.range_min && range <= scan.range_max) {
+      ++valid;
+    }
+  }
+  const double ratio = scan.ranges.empty() ? 0.0 :
+    static_cast<double>(valid) / static_cast<double>(scan.ranges.size());
+  if (ratio < search_min_valid_ratio_) {
+    reason = "valid ratio " + std::to_string(ratio);
+    search_consistency_ok_count_ = 0;
+    prev_scan_valid_ = false;
+    return false;
+  }
+
+  // (2) 자세 — 기울어진 스캔 평면은 2D 정합의 전제를 깬다.
+  if (propagation_ && propagation_->relativeTiltDeg() > search_max_tilt_deg_) {
+    // 이 에피소드에 자세 이벤트가 있었음을 기록한다 — heading prior가
+    // 정당하게 무효가 되므로 플립 조항을 면제해야 한다.
+    lost_imu_event_ = true;
+    reason = "tilt " + std::to_string(propagation_->relativeTiltDeg());
+    search_consistency_ok_count_ = 0;
+    prev_scan_valid_ = false;
+    return false;
+  }
+
+  // (3) 스캔-투-스캔 자기일관성은 매 스캔 갱신되는 스트릭으로 판정한다.
+  //     (updateScanConsistency 참조 — Lost 시도 때만 갱신하면 붕괴 직후 첫
+  //     검사가 아주 오래된 스캔과 비교되어 무의미한 값이 나온다.)
+  if (search_consistency_ok_count_ < search_consistency_frames_) {
+    reason = "consistency streak " + std::to_string(search_consistency_ok_count_);
+    return false;
+  }
+  return true;
+}
+
+// 매 스캔 호출. 직전 스캔을 DR SE(2)(회전+병진)로 현재 프레임에 옮겨 빔별
+// 사거리를 비교하고 연속 일치 프레임 수를 센다. 회전만 보정하면 주행
+// 속도에서 병진이 오탐을 낸다. 구르는 동안은 3D 회전을 2D 보정이 못 따라가
+// 자연히 무너지는데, 그게 의도된 차단이다.
+void mainNode::updateScanConsistency(const sensor_msgs::msg::LaserScan &scan) {
+  double dr_x = 0.0;
+  double dr_y = 0.0;
+  double dr_yaw = 0.0;
+  if (!currentLaserDrPose(dr_x, dr_y, dr_yaw)) {
+    search_consistency_ok_count_ = 0;
+    prev_scan_valid_ = false;
+    return;
+  }
+  bool consistent = false;
+  if (prev_scan_valid_ && prev_scan_.ranges.size() == scan.ranges.size() &&
+      scan.angle_increment > 0.0) {
+    const double delta_x = dr_x - prev_scan_dr_x_;
+    const double delta_y = dr_y - prev_scan_dr_y_;
+    const double cos_ref = std::cos(-prev_scan_dr_yaw_);
+    const double sin_ref = std::sin(-prev_scan_dr_yaw_);
+    // 직전 라이다 프레임 기준 이동량.
+    const double move_x = cos_ref * delta_x - sin_ref * delta_y;
+    const double move_y = sin_ref * delta_x + cos_ref * delta_y;
+    const double move_yaw = normalizeAngle(dr_yaw - prev_scan_dr_yaw_);
+    std::size_t compared = 0;
+    std::size_t agree = 0;
+    for (std::size_t i = 0; i < prev_scan_.ranges.size(); ++i) {
+      const double r = static_cast<double>(prev_scan_.ranges[i]);
+      if (!std::isfinite(r) || r < prev_scan_.range_min || r > prev_scan_.range_max) {
+        continue;
+      }
+      // 직전 스캔의 점을 현재 라이다 프레임으로 옮긴다.
+      const double angle = static_cast<double>(prev_scan_.angle_min) +
+        static_cast<double>(i) * static_cast<double>(prev_scan_.angle_increment);
+      const double px = r * std::cos(angle) - move_x;
+      const double py = r * std::sin(angle) - move_y;
+      const double cos_m = std::cos(-move_yaw);
+      const double sin_m = std::sin(-move_yaw);
+      const double qx = cos_m * px - sin_m * py;
+      const double qy = sin_m * px + cos_m * py;
+      const double predicted_range = std::hypot(qx, qy);
+      const double predicted_angle = std::atan2(qy, qx);
+      const int index = static_cast<int>(std::llround(
+        (predicted_angle - static_cast<double>(scan.angle_min)) /
+        static_cast<double>(scan.angle_increment)));
+      if (index < 0 || index >= static_cast<int>(scan.ranges.size())) {
+        continue;
+      }
+      const double observed = static_cast<double>(scan.ranges[index]);
+      if (!std::isfinite(observed) || observed < scan.range_min ||
+          observed > scan.range_max) {
+        continue;
+      }
+      ++compared;
+      if (std::abs(observed - predicted_range) < search_consistency_inlier_m_) {
+        ++agree;
+      }
+    }
+    if (compared > 0) {
+      const double fraction =
+        static_cast<double>(agree) / static_cast<double>(compared);
+      consistent = fraction >= search_consistency_fraction_;
+      last_consistency_fraction_ = fraction;
+    }
+  }
+  prev_scan_ = scan;
+  prev_scan_valid_ = true;
+  prev_scan_dr_x_ = dr_x;
+  prev_scan_dr_y_ = dr_y;
+  prev_scan_dr_yaw_ = dr_yaw;
+
+  if (consistent) {
+    ++search_consistency_ok_count_;
+  } else {
+    search_consistency_ok_count_ = 0;
+  }
+}
+
+double mainNode::scanSignature(const sensor_msgs::msg::LaserScan &scan) {
+  double sum = 0.0;
+  std::size_t count = 0;
+  for (const float range : scan.ranges) {
+    if (std::isfinite(range) && range >= scan.range_min && range <= scan.range_max) {
+      sum += static_cast<double>(range);
+      ++count;
+    }
+  }
+  return count > 0 ? sum / static_cast<double>(count) : 0.0;
+}
+
+double mainNode::scanChangeMetric(const sensor_msgs::msg::LaserScan &scan) const {
+  if (reloc_attempt_signature_ <= 0.0) {
+    return 0.0;
+  }
+  return std::abs(scanSignature(scan) - reloc_attempt_signature_);
+}
+
+// [메인 스레드] 탐색에 필요한 입력을 전부 값으로 복사해 둡니다. 여기서만
+// propagation_/scan_history_/pose_history_ 같은 노드 상태를 만집니다.
+mainNode::GlobalSearchRequest mainNode::buildGlobalSearchRequest(
   const sensor_msgs::msg::LaserScan &scan) {
+  GlobalSearchRequest request;
+
   // 현재 라이다 DR pose. 궤적 정합과 multi-scan 둘 다 필요합니다.
   double laser_x = 0.0;
   double laser_y = 0.0;
@@ -908,21 +1556,20 @@ std::vector<Relocalization::Hypothesis> mainNode::runGlobalSearch(
       pose_ok = true;
     }
   }
+  request.laser_yaw = laser_yaw;
 
   // 스캔 이력 + 현재 스캔을 relocalizeMultiple/Trajectory 공용 체인으로
   // 접습니다. 연속 라이다 pose a->b의 상대 이동(a 프레임 기준)입니다.
-  std::vector<sensor_msgs::msg::LaserScan> scans;
-  std::vector<Relocalization::RelativeMotion> motions;
   if (pose_ok) {
     std::vector<std::array<double, 3>> chain;
     chain.reserve(scan_history_.size() + 1);
     for (const ScanSnapshot &snapshot : scan_history_) {
-      scans.push_back(snapshot.scan);
+      request.scans.push_back(snapshot.scan);
       chain.push_back({snapshot.x, snapshot.y, snapshot.yaw});
     }
-    scans.push_back(scan);
+    request.scans.push_back(scan);
     chain.push_back({laser_x, laser_y, laser_yaw});
-    motions.reserve(chain.size() - 1);
+    request.motions.reserve(chain.size() - 1);
     for (std::size_t index = 0; index + 1 < chain.size(); ++index) {
       const double delta_x = chain[index + 1][0] - chain[index][0];
       const double delta_y = chain[index + 1][1] - chain[index][1];
@@ -932,14 +1579,16 @@ std::vector<Relocalization::Hypothesis> mainNode::runGlobalSearch(
       motion.dx = cos_ref * delta_x - sin_ref * delta_y;
       motion.dy = sin_ref * delta_x + cos_ref * delta_y;
       motion.dyaw = normalizeAngle(chain[index + 1][2] - chain[index][2]);
-      motions.push_back(motion);
+      request.motions.push_back(motion);
     }
+  } else {
+    request.scans.push_back(scan);
   }
 
   // 코너를 포함한 충분한 궤적이 모였으면 궤적-모양 정합이 최우선입니다.
   // 스캔 채점은 낡은 맵/자기유사 트랙에서 앨리어스에 속지만, 주행로
   // 배치는 그대로라 궤적 정합은 진짜 배치를 찾습니다. 루프 위상은
-  // 반환 직전 multi-scan 공동 채점이 가립니다.
+  // multi-scan 공동 채점이 가립니다.
   if (pose_ok && pose_history_.size() >= 8) {
     double distance = 0.0;
     double rotation = 0.0;
@@ -952,37 +1601,66 @@ std::vector<Relocalization::Hypothesis> mainNode::runGlobalSearch(
     }
     if (distance >= trajectory_fit_min_distance_m_ &&
         rotation >= trajectory_fit_min_rotation_deg_ * kPi / 180.0) {
-      std::vector<std::array<double, 2>> points;
-      points.reserve(pose_history_.size() + 1);
+      request.trajectory_points.reserve(pose_history_.size() + 1);
       for (const auto &entry : pose_history_) {
-        points.push_back({entry[0], entry[1]});
+        request.trajectory_points.push_back({entry[0], entry[1]});
       }
-      points.push_back({laser_x, laser_y});
-      try {
-        auto hypotheses = relocalization_->relocalizeTrajectory(
-          points, laser_yaw, scans, motions);
-        if (!hypotheses.empty()) {
-          RCLCPP_INFO(
-            this->get_logger(),
-            "trajectory fit: %zu hypotheses over %.1f m / %.0f deg, "
-            "top(%.2f,%.2f,%.1f) joint=%.4f",
-            hypotheses.size(), distance, rotation * 180.0 / kPi,
-            hypotheses.front().x, hypotheses.front().y,
-            hypotheses.front().yaw * 180.0 / kPi,
-            hypotheses.front().score);
-          return hypotheses;
-        }
-      } catch (const std::exception &error) {
-        RCLCPP_WARN_THROTTLE(
-          this->get_logger(), *this->get_clock(), 10000,
-          "Trajectory fit failed: %s", error.what());
-      }
+      request.trajectory_points.push_back({laser_x, laser_y});
+      request.trajectory_distance = distance;
+      request.trajectory_rotation = rotation;
     }
   }
-  if (scans.size() > 1) {
-    return relocalization_->relocalizeMultiple(scans, motions);
+  return request;
+}
+
+// [워커 스레드] 순수 계산부. 노드 상태를 만지지 않고 relocalization_ 만
+// 사용합니다. 동시에 한 건만 도는 것이 호출부에서 보장되고,
+// relocalization_ 을 바꾸는 지점(맵 교체/종료)은 먼저 워커를 기다립니다.
+// 로거/시계는 여기서 건드리지 않고 결과 구조체로 실어 보냅니다.
+mainNode::GlobalSearchResult mainNode::executeGlobalSearch(
+  const GlobalSearchRequest &request) {
+  GlobalSearchResult result;
+  if (!relocalization_ || request.scans.empty()) {
+    return result;
   }
-  return relocalization_->relocalizeMultiple(scan);
+  const auto worker_entry = std::chrono::steady_clock::now();
+  struct Timer {
+    std::chrono::steady_clock::time_point start;
+    double *out;
+    ~Timer() {
+      *out = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    }
+  } timer{worker_entry, &result.elapsed_ms};
+
+  if (!request.trajectory_points.empty()) {
+    try {
+      auto hypotheses = relocalization_->relocalizeTrajectory(
+        request.trajectory_points, request.laser_yaw,
+        request.scans, request.motions);
+      if (!hypotheses.empty()) {
+        result.hypotheses = std::move(hypotheses);
+        result.from_trajectory = true;
+        result.trajectory_distance = request.trajectory_distance;
+        result.trajectory_rotation = request.trajectory_rotation;
+        result.scan_points = relocalization_->lastDiagnostics().scan_points;
+        return result;
+      }
+    } catch (const std::exception &error) {
+      result.error = std::string("trajectory fit: ") + error.what();
+    }
+  }
+
+  try {
+    result.hypotheses = request.scans.size() > 1
+      ? relocalization_->relocalizeMultiple(request.scans, request.motions)
+      : relocalization_->relocalizeMultiple(request.scans.front());
+    result.scan_points = relocalization_->lastDiagnostics().scan_points;
+  } catch (const std::exception &error) {
+    result.error = error.what();
+    result.hypotheses.clear();
+  }
+  return result;
 }
 
 void mainNode::updateScanParticles(double best_main_score, particle *particles,
@@ -1112,6 +1790,36 @@ void mainNode::setState(LocalizationState next) {
   if (state_ == next) {
     return;
   }
+  // 이력은 비우지 않습니다.
+  //
+  // 예전에는 "전제가 틀렸으니 그 위에 쌓인 이력도 버린다"로 폐기했는데,
+  // 실측(icra)에서 부작용이 훨씬 컸습니다. 이력은 0.5 m/15도 이동이 있어야
+  // 쌓이는데 Lost 직후는 차가 정지·서행하는 구간이라 재구축이 가장 느립니다
+  // — 판별력이 가장 필요한 순간과 정확히 겹칩니다. 실제로 붕괴 0.07초 뒤
+  // 유효점 266/541짜리 단일 스캔으로 전역 탐색이 돌아 17 m 떨어진 앨리어스에
+  // 시드했고(모든 게이트 통과), 이력이 2장 모이는 데 7초가 걸렸습니다.
+  //
+  // 오염 대응은 폐기가 아니라 (a) 삽입 시점 배제(전복/저품질 스캔은 애초에
+  // 안 넣음)와 (b) 탐색 시점 배제(DR 체인이 끊긴 뷰는 그 탐색에서 무효)로
+  // 범위를 좁혔습니다.
+  if (next == LocalizationState::Lost) {
+    // 정전 구간 DR 오차 계측용 앵커.
+    const auto &fused = estimation_.last();
+    double dr_x = 0.0;
+    double dr_y = 0.0;
+    double dr_yaw = 0.0;
+    lost_imu_event_ = false;
+    lost_anchor_valid_ = fused.valid && currentLaserDrPose(dr_x, dr_y, dr_yaw);
+    if (lost_anchor_valid_) {
+      lost_fused_x_ = fused.x;
+      lost_fused_y_ = fused.y;
+      lost_fused_yaw_ = fused.yaw;
+      lost_dr_x_ = dr_x;
+      lost_dr_y_ = dr_y;
+      lost_dr_yaw_ = dr_yaw;
+      lost_stamp_ = this->now().seconds();
+    }
+  }
   state_ = next;
   publishState();
 }
@@ -1207,6 +1915,97 @@ void mainNode::publishState() {
   state_pub_->publish(message);
 }
 
+// 준비된 스캔으로 전 파티클을 채점합니다(청크 병렬).
+void mainNode::scoreAllParticles(particle *particles, int32_t particle_count) {
+  const unsigned scoring_workers = scoring_threads_ > 0 ?
+    static_cast<unsigned>(scoring_threads_) :
+    std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
+  if (scoring_workers <= 1 || particle_count < 256) {
+    for (int32_t index = 0; index < particle_count; ++index) {
+      scoring_->scorePrepared(particles[index]);
+    }
+    return;
+  }
+  std::vector<std::thread> workers;
+  workers.reserve(scoring_workers);
+  const int32_t chunk =
+    (particle_count + static_cast<int32_t>(scoring_workers) - 1) /
+    static_cast<int32_t>(scoring_workers);
+  for (unsigned w = 0; w < scoring_workers; ++w) {
+    const int32_t begin = static_cast<int32_t>(w) * chunk;
+    const int32_t end = std::min(particle_count, begin + chunk);
+    if (begin >= end) {
+      break;
+    }
+    workers.emplace_back([this, particles, begin, end]() {
+      for (int32_t index = begin; index < end; ++index) {
+        scoring_->scorePrepared(particles[index]);
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+}
+
+// 다중 가설 판별 가속.
+//
+// 가중치는 무기억이다 - normalizeWeights()가 직전 가중치에 곱하지 않고 현재
+// 스캔의 score[0]만으로 새로 계산한다. 따라서 같은 스캔을 여러 번 채점해도
+// 결과가 완전히 동일하고 정보가 늘지 않는다. 그래서 이 버스트는 "관측 반복"이
+// 아니라 "국소 최적화"다:
+//
+//   지터(점점 축소) -> 채점 -> 정규화 -> 리샘플
+//
+// 각 모드의 파티클이 자기 주변에서 최선의 정합 위치를 찾아 들어간다. 진짜
+// 모드는 실제 pose로 빨려들어가 점수가 크게 오르지만, 가짜 모드는 어디로
+// 움직여도 맵과 안 맞으므로 점수가 안 오른다. 그 대비가 모드 질량 차이로
+// 나타나 주행 없이도 판별이 진행된다.
+//
+// 리샘플은 이동량 게이트를 우회한다(정지 중 다양성 손실을 막는 게이트인데,
+// 여기서는 지터가 다양성을 계속 다시 넣어주므로 안전하다).
+bool mainNode::skipLooksDynamic(double &speed_out, double &ego_out) const {
+  speed_out = 0.0;
+  ego_out = 0.0;
+  // 유효 샘플 두 개 이상이어야 속도를 낼 수 있다.
+  std::vector<const SkipCentroidSample *> samples;
+  samples.reserve(beamskip_centroids_.size());
+  for (const auto &sample : beamskip_centroids_) {
+    if (sample.valid) {
+      samples.push_back(&sample);
+    }
+  }
+  // 표본이 적거나 시간 baseline이 짧으면 속도 추정이 통째로 잡음이다.
+  // 스킵 빔이 있는 프레임만 표본이 되므로 창이 차 있어도 표본은 2개일 수
+  // 있고, 그때 dt는 한 스캔(25 ms)이라 20 cm 보정이 8 m/s로 환산된다.
+  // 억제는 감지기를 끄는 방향이라 근거가 얇으면 하지 않는다.
+  if (static_cast<int>(samples.size()) < dynamic_skip_min_samples_) {
+    return false;
+  }
+  // 창 전체의 순 이동을 경과 시간으로 나눈다. 프레임별 차분의 평균보다
+  // 잡음에 둔감하고, 한 방향으로 꾸준히 움직이는 물체를 잘 잡는다.
+  const SkipCentroidSample &first = *samples.front();
+  const SkipCentroidSample &last = *samples.back();
+  const double dt = last.stamp - first.stamp;
+  if (!(dt >= dynamic_skip_min_dt_)) {
+    return false;
+  }
+  speed_out = std::hypot(last.x - first.x, last.y - first.y) / dt;
+  ego_out = std::hypot(last.ego_x - first.ego_x, last.ego_y - first.ego_y) / dt;
+  // 창이 pose 불연속(재시드 등)을 가로지르면 두 속도가 함께 폭발한다.
+  // 억제는 감지기를 끄는 방향이라 의심스러우면 하지 않는 쪽이 안전하다.
+  if (!std::isfinite(speed_out) || !std::isfinite(ego_out) ||
+      ego_out > ekf_parameters_.max_wheel_speed) {
+    return false;
+  }
+  // 상대차가 같은 속도로 앞서가면 중심 속도 == 에고 속도다. 에고 속도에
+  // 비례한 기준을 쓰면 대회 속도가 변해도 그대로 성립한다. 정지 중에는
+  // 분모가 0이 되므로 절대 하한을 함께 둔다.
+  const double threshold =
+    std::max(dynamic_skip_speed_mps_, dynamic_skip_ego_ratio_ * ego_out);
+  return speed_out > threshold;
+}
+
 void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
   if (!filter_.initialized()) {
     setState(LocalizationState::Lost);
@@ -1287,6 +2086,31 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
       }
       beamskip_bad_frames_.pop_front();
     }
+
+    // 스킵 중심을 맵 프레임으로 옮겨 같은 창 길이로 보관한다.
+    //
+    // 좌표 기준은 dead reckoning이 아니라 직전 융합 pose(스캔 보정 포함)다.
+    // 이 환경은 휠 슬립이 심해 DR로는 정지 물체도 움직이는 것처럼 보인다.
+    // 각 샘플이 자기 시점의 보정된 pose를 쓰므로 창 안에 DR 누적이 없다.
+    // (감시가 무장된 구간은 아직 미아 확정 전이라 PF pose가 유효하다.)
+    SkipCentroidSample sample;
+    const auto &fused_pose = estimation_.last();
+    if (beam_skip.skip_beams > 0 && fused_pose.valid) {
+      const double cos_yaw = std::cos(fused_pose.yaw);
+      const double sin_yaw = std::sin(fused_pose.yaw);
+      sample.x =
+        fused_pose.x + cos_yaw * beam_skip.centroid_x - sin_yaw * beam_skip.centroid_y;
+      sample.y =
+        fused_pose.y + sin_yaw * beam_skip.centroid_x + cos_yaw * beam_skip.centroid_y;
+      sample.ego_x = fused_pose.x;
+      sample.ego_y = fused_pose.y;
+      sample.stamp = rclcpp::Time(scan.header.stamp).seconds();
+      sample.valid = true;
+    }
+    beamskip_centroids_.push_back(sample);
+    while (static_cast<int>(beamskip_centroids_.size()) > beamskip_lost_window_) {
+      beamskip_centroids_.pop_front();
+    }
     // 다중 가설이 아직 판별 중(Converging & alive>1)에는 발동하지
     // 않습니다 — 뿌린 클러스터가 하나로 뭉치거나 없어질 때까지 다음
     // 리로컬을 막는 사용자 설계. 혼합 pose로 잰 프레임이 재무장 순간
@@ -1297,50 +2121,39 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
     if (!beam_watch_armed) {
       beamskip_bad_frames_.clear();
       beamskip_bad_count_ = 0;
+      beamskip_centroids_.clear();
+    }
+    // 창을 채운 미설명 빔이 '움직이는 물체'였다면 미아 증거가 아니다.
+    // 같은 속도로 앞서가는 상대차가 정확히 이 경우다.
+    double skip_speed = 0.0;
+    double ego_speed = 0.0;
+    if (beam_watch_armed && dynamic_skip_reject_ &&
+        beamskip_bad_count_ >= beamskip_lost_count_ &&
+        skipLooksDynamic(skip_speed, ego_speed)) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 2000,
+        "beam-skip collapse suppressed: centroid %.2f m/s vs ego %.2f m/s "
+        "(%d/%d frames, skip %.2f) — moving object.",
+        skip_speed, ego_speed, beamskip_bad_count_, beamskip_lost_window_,
+        beam_skip.proposed_fraction);
+      beamskip_bad_frames_.clear();
+      beamskip_bad_count_ = 0;
     }
     if (beam_watch_armed &&
         beamskip_bad_count_ >= beamskip_lost_count_) {
       RCLCPP_WARN(
         this->get_logger(),
         "Beam-skip consensus collapse: %d/%d frames unexplained "
-        "(latest skip fraction %.2f). Lost.",
+        "(skip fraction %.2f, threshold %.2f). Lost.",
         beamskip_bad_count_, beamskip_lost_window_,
-        beam_skip.proposed_fraction);
+        beam_skip.proposed_fraction, beamskip_lost_fraction_);
       announceReloc("RELOC: beam consensus", 0.95f, 0.78f, 0.10f);
       setState(LocalizationState::Lost);
       beamskip_bad_frames_.clear();
       beamskip_bad_count_ = 0;
     }
   }
-  const unsigned scoring_workers = scoring_threads_ > 0 ?
-    static_cast<unsigned>(scoring_threads_) :
-    std::min(4u, std::max(1u, std::thread::hardware_concurrency()));
-  if (scoring_workers <= 1 || particle_count < 256) {
-    for (int32_t index = 0; index < particle_count; ++index) {
-      scoring_->scorePrepared(particles[index]);
-    }
-  } else {
-    std::vector<std::thread> workers;
-    workers.reserve(scoring_workers);
-    const int32_t chunk =
-      (particle_count + static_cast<int32_t>(scoring_workers) - 1) /
-      static_cast<int32_t>(scoring_workers);
-    for (unsigned w = 0; w < scoring_workers; ++w) {
-      const int32_t begin = static_cast<int32_t>(w) * chunk;
-      const int32_t end = std::min(particle_count, begin + chunk);
-      if (begin >= end) {
-        break;
-      }
-      workers.emplace_back([this, particles, begin, end]() {
-        for (int32_t index = begin; index < end; ++index) {
-          scoring_->scorePrepared(particles[index]);
-        }
-      });
-    }
-    for (auto &worker : workers) {
-      worker.join();
-    }
-  }
+  scoreAllParticles(particles, particle_count);
 
   // ---- 스캔 탐색 풀 갱신 + 우위 시 주입 ----
   {
@@ -1521,31 +2334,85 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
 
   // ---- 다중 가설 수렴 판정 ----
   // 정지 중에는 앨리어스를 구분할 수 없으므로(0526-1 초기화 실패의 교훈)
-  // 지배 질량 조건을 유지한 채 실제로 주행한 거리로만 수렴을 셉니다.
+  // 지배 질량 조건을 유지한 채 실제로 주행한 양으로만 수렴을 셉니다.
+  //
+  // 다만 "얼마나 움직였나"가 아니라 "얼마나 알아냈나"로 세야 합니다. 복도를
+  // 따라 직진하면 아무리 가도 앨리어스가 안 풀리지만, 특징이 풍부한 곳에서는
+  // 조금만 움직여도 판별이 끝납니다. 그래서 이동량을 그 방향의 기하 관측성
+  // 으로 가중해 누적합니다:
+  //
+  //     c(v)      = (v.e0)^2 c0 + (v.e1)^2 c1      // 방향별 신뢰도
+  //     progress += |dp| * c(dp_hat)
+  //     rot      += |dpsi| * (c0 + c1) / 2
+  //
+  // e1(약축)이 곧 퇴화 방향이므로, 그쪽으로 움직이면 진행량이 거의 안 쌓여
+  // 자동으로 더 기다리게 됩니다. 관측성을 모르면 가중 1.0(기존 동작).
+  //
+  // 맵 전체가 퇴화면 영원히 확정 못 하므로 생(raw) 이동량에 상한을 둡니다.
   if (state_ == LocalizationState::Converging) {
     if (mode_summary.dominant_mass >= converge_mass_) {
       if (motion.valid) {
-        converge_accumulated_ += std::hypot(motion.longitudinal, motion.lateral);
-        converge_rotation_accumulated_ += std::abs(motion.yaw);
+        const double translation =
+          std::hypot(motion.longitudinal, motion.lateral);
+        const double rotation = std::abs(motion.yaw);
+        converge_raw_translation_ += translation;
+        converge_raw_rotation_ += rotation;
+
+        double translation_gain = 1.0;
+        double rotation_gain = 1.0;
+        if (observability.valid && converge_use_observability_) {
+          const double c0 = observability.confidence(0);
+          const double c1 = observability.confidence(1);
+          rotation_gain = 0.5 * (c0 + c1);
+          if (translation > 1.0e-9 && previous.valid) {
+            // motion은 직전 pose의 body 프레임이므로 map 프레임으로 돌립니다.
+            const double cos_yaw = std::cos(previous.yaw);
+            const double sin_yaw = std::sin(previous.yaw);
+            const Eigen::Vector2d direction{
+              (cos_yaw * motion.longitudinal - sin_yaw * motion.lateral) /
+                translation,
+              (sin_yaw * motion.longitudinal + cos_yaw * motion.lateral) /
+                translation};
+            const double along0 = direction.dot(observability.eigenvectors.col(0));
+            const double along1 = direction.dot(observability.eigenvectors.col(1));
+            translation_gain = along0 * along0 * c0 + along1 * along1 * c1;
+          } else {
+            translation_gain = rotation_gain;
+          }
+        }
+        converge_accumulated_ += translation * translation_gain;
+        converge_rotation_accumulated_ += rotation * rotation_gain;
       }
       // 직선 주행만으로는 복도 앨리어스가 판별되지 않으므로(스래싱 교훈)
       // 거리와 함께 코너 통과에 해당하는 누적 회전을 요구합니다.
-      if (converge_accumulated_ >= converge_distance_m_ &&
-          converge_rotation_accumulated_ >=
-            converge_rotation_deg_ * kPi / 180.0) {
+      const bool informed =
+        converge_accumulated_ >= converge_distance_m_ &&
+        converge_rotation_accumulated_ >= converge_rotation_deg_ * kPi / 180.0;
+      // 퇴화 구간에서 무한 대기하지 않도록 하는 안전 상한입니다.
+      const bool capped =
+        converge_raw_translation_ >=
+          converge_distance_m_ * converge_raw_cap_factor_ &&
+        converge_raw_rotation_ >=
+          converge_rotation_deg_ * kPi / 180.0 * converge_raw_cap_factor_;
+      if (informed || capped) {
         setState(LocalizationState::Tracking);
         RCLCPP_INFO(
           this->get_logger(),
-          "Hypotheses converged after %.2f m / %.0f deg: mode %u mass %.2f "
-          "(%d alive). Tracking.",
+          "Hypotheses converged after %.2f m / %.0f deg informed "
+          "(raw %.2f m / %.0f deg%s): mode %u mass %.2f (%d alive). Tracking.",
           converge_accumulated_,
           converge_rotation_accumulated_ * 180.0 / kPi,
+          converge_raw_translation_,
+          converge_raw_rotation_ * 180.0 / kPi,
+          (!informed && capped) ? ", CAP" : "",
           mode_summary.dominant, mode_summary.dominant_mass,
           mode_summary.alive_modes);
       }
     } else {
       converge_accumulated_ = 0.0;
       converge_rotation_accumulated_ = 0.0;
+      converge_raw_translation_ = 0.0;
+      converge_raw_rotation_ = 0.0;
     }
   }
 

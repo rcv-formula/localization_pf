@@ -397,16 +397,26 @@ scanScoring::BeamSkipStats scanScoring::computeBeamSkip(
         return stats;
     }
     std::size_t skip_count = 0;
+    // 스킵 후보 끝점의 중심(움직이는 물체 판별용) 누적.
+    double skip_sum_x = 0.0;
+    double skip_sum_y = 0.0;
     for (std::size_t i = 0; i < beam_count; ++i) {
         const double fraction =
             static_cast<double>(good[i]) / static_cast<double>(sampled);
         if (fraction < beam_skip_consensus_) {
             beam_skip_mask_[i] = 1;
             ++skip_count;
+            skip_sum_x += prep_range_[i] * prep_cos_[i];
+            skip_sum_y += prep_range_[i] * prep_sin_[i];
         }
     }
     stats.proposed_fraction =
         static_cast<double>(skip_count) / static_cast<double>(beam_count);
+    stats.skip_beams = skip_count;
+    if (skip_count > 0) {
+        stats.centroid_x = skip_sum_x / static_cast<double>(skip_count);
+        stats.centroid_y = skip_sum_y / static_cast<double>(skip_count);
+    }
     // 대부분의 빔이 불일치하면 미아 가능성 — 스킵 포기(복구 증거 보존).
     if (stats.proposed_fraction > beam_skip_error_threshold_) {
         beam_skip_mask_.assign(beam_count, 0);

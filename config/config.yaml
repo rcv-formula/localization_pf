@@ -79,6 +79,12 @@
       wheel_velocity_variance: 0.0009
       lateral_accel_variance: 0.1225
       slip_gain: 20.0
+      # 경량 dead-reckoning(100 Hz 궤적 버퍼 = 출력 보간 대상)의 기울기 보정.
+      # IMU AHRS 자세로 heading rate를 수평면에 투영하고 이동거리를 cos(pitch)로
+      # 줄입니다. 끄면 평지 가정으로 되돌아갑니다. EKF 갱신식은 건드리지 않음.
+      dr_use_imu_tilt: true
+      # 기준자세 대비 이보다 기울면 보정 중단(들어올림/전복 구간)
+      dr_tilt_max_deg: 45.0
       enable_startup_gravity_calibration: true
       gravity_calibration_path: ""
       process_position_std: 0.02
@@ -197,6 +203,13 @@
       converge_distance_m: 1.0
       # 직선 1m로는 복도 앨리어스 판별 불가 — 코너 통과(누적 회전) 요구.
       converge_rotation_deg: 90.0
+      # 수렴 누적을 "얼마나 움직였나"가 아니라 "얼마나 알아냈나"로 세기.
+      # 이동량을 그 방향의 기하 관측성 c(v)로 가중해 누적하므로, 퇴화 방향
+      # (복도 축)으로 직진하면 진행량이 거의 안 쌓여 자동으로 더 기다리고,
+      # 특징이 풍부한 곳에서는 일찍 확정된다. false면 기존 생거리 누적.
+      converge_use_observability: false
+      # 맵 전체가 퇴화면 영원히 확정 못 하므로 생 이동량 상한(요구치 x 배수).
+      converge_raw_cap_factor: 3.0
       # 노이즈 회복 건강도 스케일 하한(트리거 아님 — Lost 트리거는 빔 합의와
       # off-map 둘뿐).
       score_fail_threshold: -9.0
@@ -206,6 +219,22 @@
       beamskip_lost_fraction: 0.25
       beamskip_lost_window: 10
       beamskip_lost_count: 4
+      # 움직이는 물체로 인한 오발동 억제. 같은 속도로 앞서가는 상대차는
+      # 로봇 프레임에서 정지라 위 창 조건을 그대로 통과하지만, 세계 좌표
+      # 에서는 에고 속도로 움직인다. 좌표는 스캔 보정이 들어간 직전 융합
+      # pose로 내며(휠 슬립이 심해 dead reckoning은 못 쓴다), 감시가 무장된
+      # 구간은 아직 미아 확정 전이라 그 pose가 유효하다.
+      # 창의 스킵 중심 속도가 아래 기준을 넘으면 미아 증거로 보지 않는다.
+      # 상대차가 있는 데이터가 아직 없어 미검증. 검증 전까지 꺼 둔다.
+      dynamic_skip_reject: false
+      # 정지 중에는 에고 비례 기준이 0이 되므로 절대 하한을 함께 둔다.
+      dynamic_skip_speed_mps: 0.3
+      dynamic_skip_ego_ratio: 0.5
+      # 속도 추정의 최소 근거. 스킵 빔이 있는 프레임만 표본이 되므로 창이
+      # 차 있어도 표본은 2개일 수 있고, 그때 dt는 한 스캔(25ms)이라 20cm
+      # 보정이 8m/s로 환산된다. 근거가 얇으면 억제하지 않는다.
+      dynamic_skip_min_samples: 4
+      dynamic_skip_min_dt: 0.1
       # off-map 감지: fused가 free 아닌 셀에 머무는 비율(EMA, 시간상수
       # window)이 임계를 넘으면 배치 오류로 보고 Lost(닮은꼴 루프 앨리어스).
       map_consistency_window_s: 5.0
@@ -253,12 +282,141 @@
       # 이 거리/각도보다 가까우면 같은 가설로 흡수(180도 플립은 각도로 생존).
       hypothesis_min_separation_m: 0.8
       hypothesis_min_separation_deg: 25.0
+      # 절대 품질 하한 — 예측 프로파일 대비 RMS 오차[m]. score_ratio는 best
+      # 대비 상대 기준이라 best가 쓰레기면 하한도 무너진다(icra 실측: best
+      # RMS 4.5m가 시드되어 곧바로 재리로컬). 정상 시드는 RMS 0.17~0.63m.
+      # 0이면 끔.
+      hypothesis_max_rms_m: 1.0
       # 검증 게이트: 예측 프로파일 인라이어(|오차|<inlier_m) 비율 미달 후보
       # 탈락 — 검증 통과 후보만 파티클 시드(0=끔).
       hypothesis_verify_fraction: 0.7
       hypothesis_verify_inlier_m: 0.2
+      # --- 부호 인식(원사이드) 검증 게이트 ---
+      # 잔차 e = 실측 - 예측의 '부호'가 결정적 정보다. 미지도 물체/사람/잔해는
+      # 빔을 짧게만 만들 수 있으므로(e<0), 정답 pose에서 e>0(예측한 벽 너머가
+      # 보임)은 맵 오류나 유리 말고는 설명되지 않는다. 오답 pose는 부호가
+      # 섞인다(복도 종방향 오프셋이면 한쪽 끝은 e>0).
+      #
+      # 기존 게이트는 가림까지 분모에 넣어 "가려진 정답"을 떨어뜨렸다
+      # (실측 busan2: 가림 38%, 가시 인라이어 0.96, see-through 0.03인 후보가
+      # 전체 대비 0.6으로 계산되어 거부).
+      #
+      # false면 판정은 기존 게이트가 하고 통계만 로깅한다(섀도 모드).
+      verify_signed_gate: true
+      # e < -이 값이면 가림으로 보고 분모에서 제외.
+      verify_occlusion_m: 0.2
+      # e > +이 값이면 see-through(예측 벽 관통) = 오답의 증거.
+      verify_see_through_m: 0.25
+      # 가시 빔 중 see-through 허용 상한. 섀도 런 실측(4씬, 통과 26/거부 47):
+      # 통과의 최대가 0.20, 거부는 p10이 0.28. 0.20~0.35 어디로 잡아도 결과가
+      # 같아(인라이어가 먼저 거른다) 보수적으로 0.20.
+      verify_see_through_max: 0.20
+      # 가시 빔(전체 - 가림) 중 인라이어 비율 하한. 섀도 런 실측의 유일한
+      # 안전 지점: 통과 min 0.75 / 거부 max 0.74. 0.78로 올리면 정답 3건이
+      # 죽고, 낮추면 오답이 통과한다.
+      verify_visible_fraction: 0.75
+      # 가림이 분모를 다 먹어치운 퇴화 pose를 막는 커버리지 하한.
+      # 통과 표본의 최저 가시율이 0.75라 여유가 크다.
+      verify_min_visible_frac: 0.40
+      # 30도 섹터당 가시 빔이 이 개수 이상이면 유효 섹터.
+      verify_min_sector_beams: 15
+      # 유효 섹터가 이 개수 이상(4 = 실효 120도). 양 끝 빔 두 개로 통과하는
+      # 단순 최대-최소 스팬 대신 섹터로 센다.
+      verify_min_visible_sectors: 4
+      # 직전 시도가 빈손이면 위 retry_period_s 대신 이 짧은 주기로 재시도.
+      # 실패가 반복되는 구간은 대개 입력이 나쁜 구간이라(전복 등), 입력이
+      # 좋아지는 순간을 놓치지 않는 것이 중요하다.
+      # 실측 icra: 1초 주기로는 회복이 17초 지연됐다.
+      empty_retry_period_s: 0.1
+      # 장면이 이만큼 바뀌면(유효 빔 평균 사거리 변화[m]) 주기를 무시하고
+      # 즉시 시도. 새 관측이 들어왔으니 이전 실패가 근거가 되지 않는다.
+      scan_change_trigger_m: 0.5
+      # --- 전역 탐색 전제조건 ---
+      # 관측이 무의미한 구간에서 탐색을 돌리면 13만 후보 중 "반쯤 눈먼
+      # 스캔에 그럴듯한" 앨리어스가 반드시 나오고, 게이트는 그 스캔만 보므로
+      # 막지 못한다(실측 icra: 유효점 266/541, 붕괴 0.07초 뒤 시드, 17m 오차,
+      # 모든 게이트 통과). 셋 다 만족해야 탐색을 허용한다.
+      #
+      # 유효점 비율 하한. 가림은 짧은 리턴이라 유효점을 줄이지 않으므로
+      # 정상 가림 씬과 충돌하지 않는다. 센서 수준 이상(틸트/max-range 폭증)만
+      # 잡는다. 잠정치 — 정상 추적 구간 분포로 재보정 필요.
+      search_min_valid_ratio: 0.6
+      # 기준 자세 대비 기울기 상한[도]. 기운 평면은 2D 정합의 전제를 깬다.
+      search_max_tilt_deg: 15.0
+      # 스캔-투-스캔 자기일관성: 직전 스캔을 DR SE(2)(회전+병진)로 옮겨
+      # 빔별 사거리를 비교. 회전만 보정하면 주행 속도에서 병진이 오탐을 낸다.
+      search_consistency_inlier_m: 0.2
+      search_consistency_fraction: 0.8
+      # 연속 이 프레임 수만큼 일관성을 유지해야 탐색 허용.
+      search_consistency_frames: 3
       # --- multi-scan 공동 채점 ---
       # 과거 스캔을 DR 상대이동으로 묶어 공동 채점(복도/루프 앨리어스 제거).
+      # 이력 집계: 최신 1장 + '유효 이력 상위 비율'의 평균 (단방향 절사).
+      # 전부 평균내면 오염된 한 장이 모든 후보를 떨어뜨리고(icra: 전복 뒤
+      # 30초 가설 0개), 상위 1장만 쓰면 나머지가 일제히 반대한다는 증거를
+      # 계산해놓고 소거한다(icra: 텀블 중 0.1초 만에 17m 오시드가 모든
+      # 게이트 통과). 오염은 점수를 끌어내리기만 하므로 하위를 자르고,
+      # 요행 정합은 상위 소수에만 생기므로 상위 60% 평균이면 희석된다.
+      history_support_fraction: 0.6
+      # 재투영 DR 거리가 이보다 먼 이력 스캔은 노후로 보고 제외.
+      history_valid_dr_max_m: 4.0
+      # false면 점수는 예전 방식으로 내고 새 집계는 로깅만 한다(섀도).
+      history_new_aggregate: false
+      # 뷰 자격(채점): 가시분율이 이보다 낮으면 채점에서 경성 배제.
+      # 채점은 크기를 평균하므로 잡음 낀 크기가 섞이면 안 된다.
+      history_min_visible_frac: 0.5
+      # --- 이력 가중 다수결 (검증) ---
+      # 뷰별 판정은 절대 RMS 컷을 쓸 수 없다 — 씬별 잔여 체인 오차가 전 뷰의
+      # RMS를 일괄 상향시켜 지지/반대 대역이 씬 간에 겹친다(실측: icra 지지
+      # 뷰 1.18~1.51 vs busan2 반대 뷰 1.50~2.36). 뷰 '내부'에서 자기 최선
+      # 대비 상대 비교를 하면 그 상향이 모든 후보에 공통으로 걸려 자동 보정된다.
+      # false면 판정은 안 하고 로깅만(섀도).
+      history_majority_gate: false
+      # 통과 밴드: visRMS <= max(ratio*best, best + slack). 가산 슬랙이 없으면
+      # best가 작을 때(0.2) 잡음 수준 차이로 탈락한다.
+      history_pass_ratio: 1.5
+      history_pass_slack_m: 0.3
+      # 어떤 후보도 이만큼 이하로 설명 못 하는 뷰는 기권(반대가 아니라 무의견).
+      history_view_useless_m: 1.5
+      # 가시분율 -> 검증 가중 램프. 저가시 뷰도 약한 표를 던지되 평결을
+      # 좌우하지 못한다.
+      history_weight_low_f: 0.3
+      history_weight_high_f: 0.7
+      # 통과율 요구와 증거량 하한. 증거가 얇으면(Sum w < 2.0) 다수결을
+      # 생략하고 경쟁 시딩으로 넘긴다.
+      history_majority_fraction: 0.5
+      history_min_support_weight: 2.0
+      # --- 플립 조항 ---
+      # prior와 이 각도 넘게 다른 시드는 '비범한 주장'이라 비범한 증거를
+      # 요구한다. 차단이 아니라 기준 상향만 한다 — 이전 시드가 플립이라
+      # prior가 뒤집혀 있고 새 후보가 교정인 경우, 교정 후보는 건강한 이력
+      # 지지를 갖고 있어 상향된 기준을 통과한다. 조항이 교정을 막는 경로는 없다.
+      # IMU 자세 이벤트(전복/들림)가 있었던 에피소드는 면제 — heading prior가
+      # 정당하게 무효이기 때문이다.
+      flip_clause_enabled: true
+      flip_clause_deg: 90.0
+      # 증거가 충분하면 다수결 요구를 0.5 -> 이 값으로 상향.
+      flip_majority_fraction: 0.7
+      # 증거가 얇으면(Sum w < min_support_weight) 다수결을 요구할 수 없으므로
+      # latest를 더 엄격히 본다.
+      flip_max_see_through: 0.10
+      # --- 다수결 밴드 + 보호관찰 ---
+      # 하드 이분법은 (1) 교정 시드를 막고(체인 열화 시 정답도 지지가 흐려짐 —
+      # 실측 icra seed3 지지율 0.47), (2) 데드락을 만든다(Lost 중 이력이
+      # 동결되므로 다음 시도도 같은 판정). 애매한 구간은 거부가 아니라 적은
+      # 질량으로 함께 심고 주행이 판별하게 한다.
+      #   support >= accept     -> 수락 (질량 1.0)
+      #   probation <= s < acc  -> 보호관찰 (질량 probation_mass)
+      #   support < probation   -> 거부
+      #   증거량 부족(Sum w < min_support_weight) -> 보호관찰
+      # prior가 없으면(스타트업/리셋) 비교 대상이 없어 밴드를 적용하지 않는다.
+      # false면 판정은 안 하고 로깅만(섀도).
+      majority_band_enabled: true
+      majority_accept: 0.60
+      majority_probation: 0.25
+      probation_mass: 0.3
+      # 데드락 보험: 전원 거부가 이 시간을 넘으면 최선 후보를 보호관찰로 승격.
+      majority_escape_s: 5.0
       multi_scan_count: 12
       multi_scan_spacing_m: 0.5
       multi_scan_spacing_deg: 15.0

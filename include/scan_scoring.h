@@ -43,6 +43,15 @@ public:
     struct BeamSkipStats {
         // 스킵 후보 빔 비율(적용 여부와 무관한 원시 합의 실패율).
         double proposed_fraction{0.0};
+        // 스킵 '후보' 빔 끝점들의 중심(라이다 프레임)과 개수. 마스크가
+        // 나중에 폐기되어도(제안 비율 > error_threshold) 남습니다.
+        //
+        // 미아 판정에서 "움직이는 상대차"를 걸러내는 데 씁니다 — 같은 속도로
+        // 앞서가는 차는 로봇 프레임에서 정지라 기존 지표로는 미아와 구분되지
+        // 않지만, 월드(odom) 프레임에서는 에고 속도로 움직입니다.
+        double centroid_x{0.0};
+        double centroid_y{0.0};
+        std::size_t skip_beams{0};
         bool applied{false};
     };
     void configureBeamSkip(bool enabled, double prob_threshold,

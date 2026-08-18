@@ -181,8 +181,9 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeMultiple(
     return selectHypotheses(pool, result.best.score, &view);
 }
 
-double Relocalization::inlierFraction(
+Relocalization::VerifyStats Relocalization::computeBeamStats(
     double x, double y, double yaw, const ScanView &view) const {
+    VerifyStats stats;
     const int width = static_cast<int>(processed_map_.width);
     const int height = static_cast<int>(processed_map_.height);
     const int cell_x = static_cast<int>(std::floor(
@@ -190,12 +191,12 @@ double Relocalization::inlierFraction(
     const int cell_y = static_cast<int>(std::floor(
         (y - processed_map_.origin_y) / processed_map_.resolution));
     if (cell_x < 0 || cell_y < 0 || cell_x >= width || cell_y >= height) {
-        return 0.0;
+        return stats;
     }
     const int32_t candidate_index = processed_map_.cell_to_candidate[
         static_cast<std::size_t>(cell_y) * width + static_cast<std::size_t>(cell_x)];
     if (candidate_index < 0 || view.size() == 0) {
-        return 0.0;
+        return stats;
     }
     const int32_t ray_count = static_cast<int32_t>(parameters_.ray_count);
     const double ray_step = kTwoPi / static_cast<double>(ray_count);
@@ -207,19 +208,118 @@ double Relocalization::inlierFraction(
         static_cast<Eigen::Index>(candidate_index)).data();
     const int32_t *base = view.base_index.data();
     const float *observed = view.range.data();
-    int inliers = 0;
+
+    const double occlusion = parameters_.verify_occlusion_m;
+    const double inlier_m = parameters_.hypothesis_verify_inlier_m;
+    const double see_through = parameters_.verify_see_through_m;
+    // 30도 = 720빔 격자에서 60빈. 270도 FOV는 이 중 9개를 점유합니다.
+    constexpr std::size_t kSectorSpan = 60;
+    constexpr std::size_t kSectorCount = 12;
+    std::array<uint16_t, kSectorCount> sector_beams{};
+    double visible_square = 0.0;
+
     for (std::size_t i = 0; i < view.size(); ++i) {
         int32_t index = base[i] + yaw_index;
         if (index >= ray_count) {
             index -= ray_count;
         }
-        if (std::abs(static_cast<double>(observed[i]) -
-                     static_cast<double>(profile[index])) <
-            parameters_.hypothesis_verify_inlier_m) {
-            ++inliers;
+        // +-1빈 min/max 대역.
+        //
+        // convertScan이 빔 각도를 0.5도 격자로 반올림하고 yaw도 같은 격자로
+        // 반올림하므로 실제 방향과 프로파일 ray는 최악 0.5도(=1빈) 어긋납니다.
+        // 스침 입사에서 이 각도 오차가 사거리 오차로 증폭되어(10m/85도에서
+        // 약 1.0m) 가짜 see-through를 만듭니다 — 복도가 정확히 그 조건입니다.
+        // 선형 보간은 깊이 불연속(문틀/기둥 에지)에서 존재하지 않는 중간
+        // 사거리를 만들어 더 나쁘므로, 이웃 3개의 min/max 대역으로 흡수합니다.
+        // 에지 근처에서는 hi가 먼 벽, lo가 가까운 벽이 되어 자동 중립화됩니다.
+        const int32_t index_prev = index == 0 ? ray_count - 1 : index - 1;
+        const int32_t index_next = index == ray_count - 1 ? 0 : index + 1;
+        const double low = std::min({static_cast<double>(profile[index_prev]),
+                                     static_cast<double>(profile[index]),
+                                     static_cast<double>(profile[index_next])});
+        const double high = std::max({static_cast<double>(profile[index_prev]),
+                                      static_cast<double>(profile[index]),
+                                      static_cast<double>(profile[index_next])});
+        const double range = static_cast<double>(observed[i]);
+        ++stats.total;
+        if (range < low - occlusion) {
+            // 가림: 미지도 물체가 빔을 가로챘다. 위치 판정 근거가 아니므로
+            // 분모에서 제외합니다.
+            ++stats.occluded;
+            continue;
+        }
+        // 대역을 벗어난 초과분만 오차로 봅니다(대역 안이면 0).
+        const double error = range < low ? range - low
+                                         : (range > high ? range - high : 0.0);
+        if (error > see_through) {
+            ++stats.see_through;
+        }
+        if (std::abs(error) <= inlier_m) {
+            ++stats.inlier;
+        }
+        visible_square += error * error;
+        const std::size_t sector =
+            static_cast<std::size_t>(base[i]) / kSectorSpan;
+        if (sector < kSectorCount) {
+            ++sector_beams[sector];
         }
     }
-    return static_cast<double>(inliers) / static_cast<double>(view.size());
+
+    const uint16_t visible = stats.total - stats.occluded;
+    for (std::size_t k = 0; k < kSectorCount; ++k) {
+        if (sector_beams[k] >= parameters_.verify_min_sector_beams) {
+            ++stats.visible_sectors;
+        }
+    }
+    if (visible > 0) {
+        stats.visible_rms = static_cast<float>(
+            std::sqrt(visible_square / static_cast<double>(visible)));
+        stats.visible_inlier_frac =
+            static_cast<float>(stats.inlier) / static_cast<float>(visible);
+        stats.see_through_frac =
+            static_cast<float>(stats.see_through) / static_cast<float>(visible);
+        stats.visible_frac =
+            static_cast<float>(visible) / static_cast<float>(stats.total);
+    }
+    return stats;
+}
+
+Relocalization::VerifyStats Relocalization::verifyPose(
+    double x, double y, double yaw, const ScanView &view) const {
+    VerifyStats stats = computeBeamStats(x, y, yaw, view);
+    if (stats.total == 0) {
+        stats.fail_mask = 0x1f;
+        return stats;
+    }
+    // 단락 없이 전부 평가합니다 — 섀도 모드에서 어느 게이트가 죽였는지
+    // 읽으려면 모든 비트가 필요합니다.
+    if (stats.visible_frac < parameters_.verify_min_visible_frac) {
+        stats.fail_mask |= 1;
+    }
+    if (stats.visible_sectors < parameters_.verify_min_visible_sectors) {
+        stats.fail_mask |= 2;
+    }
+    if (stats.visible_inlier_frac < parameters_.verify_visible_fraction) {
+        stats.fail_mask |= 4;
+    }
+    if (stats.see_through_frac > parameters_.verify_see_through_max) {
+        stats.fail_mask |= 8;
+    }
+    if (parameters_.hypothesis_max_rms_m > 0.0 &&
+        stats.visible_rms > parameters_.hypothesis_max_rms_m) {
+        stats.fail_mask |= 16;
+    }
+    stats.pass = stats.fail_mask == 0;
+    return stats;
+}
+
+// 섀도 모드용: 기존 게이트와 같은 의미의 '전체 빔 대비' 인라이어 비율.
+// verifyPose가 세는 inlier는 가림을 제외한 분모라 값이 다릅니다. 섀도 런에서
+// 판정이 이전과 완전히 같아야 비교가 성립하므로 여기서 되돌려 계산합니다.
+double Relocalization::legacyInlierFraction(const VerifyStats &stats) {
+    return stats.total > 0
+        ? static_cast<double>(stats.inlier) / static_cast<double>(stats.total)
+        : 0.0;
 }
 
 std::vector<Relocalization::Hypothesis> Relocalization::selectHypotheses(
@@ -229,17 +329,45 @@ std::vector<Relocalization::Hypothesis> Relocalization::selectHypotheses(
     // 위치/각도 둘 다 가까울 때만 같은 가설로 흡수하므로, 같은 위치의
     // 180도 플립 후보는 별도 가설로 살아남습니다.
     // 점수는 음의 평균 오차라 best에 배율을 곱하면 하한이 됩니다.
-    const double score_floor =
+    // 상대 하한 + 집계 절대 하한.
+    //
+    // 집계는 유효 이력 수에 따라 조성이 널뛰어 절대 임계의 의미가 표류하는
+    // 문제가 있지만, 그것을 떼어내자 "이력 전체가 반대해도 latest만 좋으면
+    // 통과"가 됐다(실측 busan2: latest 가시 RMS 0.44로 게이트를 통과했으나
+    // 집계 RMS 2.73 — 이력 11장이 만장일치로 반대한 1 m급 앨리어스가 시드됨.
+    // prior 대비 오차가 0.22 m에서 1.13 m로 악화).
+    //
+    // 항구적 해법은 임계 재조정이 아니라 이력 부호 게이트 다수결이고, 그것이
+    // 착지할 때까지의 브리지로 절대 하한을 유지한다. 방어를 제거하는 변경은
+    // 대체 방어와 같은 배포에서만 해야 한다는 교훈의 적용이다.
+    double score_floor =
         best_score * std::max(1.0, parameters_.hypothesis_score_ratio);
+    if (parameters_.hypothesis_max_rms_m > 0.0) {
+        const double absolute_floor =
+            -(parameters_.hypothesis_max_rms_m * parameters_.hypothesis_max_rms_m);
+        score_floor = std::max(score_floor, absolute_floor);
+    }
     const double min_separation = parameters_.hypothesis_min_separation_m;
     const double min_angle =
         parameters_.hypothesis_min_separation_deg * kPi / 180.0;
 
     std::vector<Hypothesis> hypotheses;
     hypotheses.reserve(parameters_.max_hypotheses);
+    diagnostics_.pool_size = pool.size();
+    diagnostics_.rejected_score_floor = 0;
+    diagnostics_.absorbed_duplicate = 0;
+    diagnostics_.rejected_verify = 0;
+    diagnostics_.accepted = 0;
+    diagnostics_.best_inlier = 0.0;
+    diagnostics_.best_verify_valid = false;
     for (const PoseCandidate &item : pool) {
-        if (hypotheses.size() >= parameters_.max_hypotheses ||
-            item.score < score_floor) {
+        if (hypotheses.size() >= parameters_.max_hypotheses) {
+            break;
+        }
+        if (item.score < score_floor) {
+            // pool은 점수 내림차순이라 여기서부터 전부 탈락입니다.
+            diagnostics_.rejected_score_floor = pool.size() -
+                (&item - pool.data());
             break;
         }
         bool absorbed = false;
@@ -253,19 +381,51 @@ std::vector<Relocalization::Hypothesis> Relocalization::selectHypotheses(
             }
         }
         if (absorbed) {
+            ++diagnostics_.absorbed_duplicate;
             continue;
         }
         // 검증 게이트: 예측 프로파일 인라이어 비율 미달 후보는 탈락.
         // 통과 후보에는 비율을 실어 상위에서 재사용할 수 있게 합니다.
         double inlier = 0.0;
+        VerifyStats verify;
         if (verify_view != nullptr) {
-            inlier = inlierFraction(item.x, item.y, item.yaw, *verify_view);
-            if (parameters_.hypothesis_verify_fraction > 0.0 &&
-                inlier < parameters_.hypothesis_verify_fraction) {
+            verify = verifyPose(item.x, item.y, item.yaw, *verify_view);
+            inlier = verify.visible_inlier_frac;
+            diagnostics_.best_inlier = std::max(diagnostics_.best_inlier, inlier);
+            if (!diagnostics_.best_verify_valid) {
+                // pool은 점수 내림차순이라 첫 후보가 점수 1등입니다.
+                diagnostics_.best_verify = verify;
+                diagnostics_.best_verify_valid = true;
+            }
+            // 부호 인식 게이트는 섀도 모드에서 통계만 남기고, 판정은 기존
+            // 인라이어 게이트가 합니다(verify_signed_gate로 전환).
+            if (verify.fail_mask & 4) {
+                ++diagnostics_.rejected_verify_inlier;
+            }
+            if (verify.fail_mask & 8) {
+                ++diagnostics_.rejected_verify_seethrough;
+            }
+            if (verify.fail_mask & 3) {
+                ++diagnostics_.rejected_verify_coverage;
+            }
+            const bool rejected = parameters_.verify_signed_gate
+                ? !verify.pass
+                : (parameters_.hypothesis_verify_fraction > 0.0 &&
+                   legacyInlierFraction(verify) <
+                     parameters_.hypothesis_verify_fraction);
+            if (rejected) {
+                ++diagnostics_.rejected_verify;
                 continue;
             }
         }
-        hypotheses.push_back(Hypothesis{item.x, item.y, item.yaw, item.score, inlier});
+        ++diagnostics_.accepted;
+        Hypothesis hypothesis{item.x, item.y, item.yaw, item.score, inlier, verify};
+        hypothesis.view_rms = item.view_rms;
+        hypothesis.view_visible = item.view_visible;
+        hypothesis.view_count = item.view_count;
+        hypothesis.support_ratio = item.support_ratio;
+        hypothesis.support_weight = item.support_weight;
+        hypotheses.push_back(hypothesis);
     }
     return hypotheses;
 }
@@ -399,23 +559,185 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeMultiple(
     //    프로파일로 해당 과거 스캔을 채점합니다. 과거 pose가 free 셀을
     //    벗어나면(벽/unknown) 큰 페널티 — 닮은꼴 루프라도 궤적 전체가
     //    들어맞지 않으면 여기서 탈락합니다.
+    return finalizeCandidates(shortlist, latest, views, offsets);
+}
+
+std::vector<Relocalization::Hypothesis> Relocalization::finalizeCandidates(
+    std::vector<PoseCandidate> &shortlist,
+    const ScanView &latest,
+    const std::vector<ScanView> &views,
+    const std::vector<RelativeMotion> &offsets) {
+    // 모든 시드 후보의 단일 관문.
+    //
+    // 경로(단일 스캔/궤적/향후 멀티스캔 pool)를 불문하고 여기서 같은 단위로
+    // 채점하고 같은 게이트를 통과해야 한다. 관문이 두 곳이면 모든 방어를 두 번
+    // 구현해야 하고 언젠가 한 곳을 빠뜨린다 — 실측: 절대 하한을 단일 스캔
+    // 경로에만 복원했다가 궤적 경로로 집계 RMS 2.67짜리가 통과했다. 또 경로마다
+    // 점수 단위가 다르면 절대 하한과 상대 배율이 잴 것을 잃는다.
+    const std::size_t scan_count = views.size() + 1;
+    // 집계: 최신 1장 + '유효 이력 상위 비율'의 평균 (단방향 절사).
+    //
+    // 오염된 스캔은 점수를 끌어내리기만 하므로 하위를 자르고, 요행 정합은
+    // 상위 소수에만 생기므로 상위 60% 평균이면 희석된다. 상위 1장만 쓰면
+    // "나머지가 일제히 반대한다"는 증거를 계산해놓고 소거하게 된다.
+    std::vector<double> view_scores;
+    std::vector<double> view_visible;
+    view_scores.reserve(scan_count);
+    view_visible.reserve(scan_count);
+    std::vector<double> kept;
+    kept.reserve(scan_count);
+    bool top_recorded = false;
     for (PoseCandidate &item : shortlist) {
-        double total = item.score;
-        int used = 1;
+        view_scores.clear();
+        view_visible.clear();
         const double cos_yaw = std::cos(item.yaw);
         const double sin_yaw = std::sin(item.yaw);
         for (std::size_t k = 0; k + 1 < scan_count; ++k) {
             if (views[k].size() < parameters_.minimum_scan_points) {
                 continue;
             }
-            total += scorePoseWithProfile(
+            // 재투영 DR 거리가 멀면 노후로 보고 제외한다.
+            if (parameters_.history_valid_dr_max_m > 0.0 &&
+                std::hypot(offsets[k].dx, offsets[k].dy) >
+                  parameters_.history_valid_dr_max_m) {
+                continue;
+            }
+            // 이력 채점도 검증과 같은 빔 분류를 쓴다. 부호맹 원시 MSE를
+            // 쓰면 가림이 그대로 벌점이 되어 "가려진 정답"이 반대표로
+            // 오역된다(실측 busan2: 정답 pose에서 이력 9장이 RMS 1.45~2.91).
+            const auto view_stats = computeBeamStats(
                 item.x + cos_yaw * offsets[k].dx - sin_yaw * offsets[k].dy,
                 item.y + sin_yaw * offsets[k].dx + cos_yaw * offsets[k].dy,
                 item.yaw + offsets[k].dyaw,
                 views[k]);
-            ++used;
+            // 뷰 자격: 가시분율이 너무 낮으면 기권한다. 점수가 가시 기준으로
+            // 바뀌면서 "가시 빔 몇 개가 우연히 맞는 근맹 뷰"가 최고 점수를
+            // 가져갈 수 있게 됐기 때문이다. latest의 커버리지 플로어(0.40)보다
+            // 약간 관대하게 둔다 — 뷰는 보강 증거이지 판정 주체가 아니다.
+            if (view_stats.visible_frac < parameters_.history_min_visible_frac) {
+                continue;
+            }
+            // 점수는 -MSE 규약을 유지하되 '가시 대역초과' 기준이다.
+            view_scores.push_back(
+                -static_cast<double>(view_stats.visible_rms) *
+                 static_cast<double>(view_stats.visible_rms));
+            view_visible.push_back(static_cast<double>(view_stats.visible_frac));
         }
-        item.score = total / static_cast<double>(used);
+        kept = view_scores;
+        std::sort(kept.begin(), kept.end(), std::greater<double>());
+        // 집계의 latest 항도 같은 단위(가시 대역초과)로 맞춘다. pool 랭킹
+        // 점수(원시 MSE, 대역 없음)와 집계용 latest 점수는 다른 물건이다 —
+        // 섞으면 클린 스캔에선 티가 안 나다가 가림 창에서 갈라진다.
+        const auto latest_stats =
+            computeBeamStats(item.x, item.y, item.yaw, latest);
+        const double latest_score =
+            -static_cast<double>(latest_stats.visible_rms) *
+             static_cast<double>(latest_stats.visible_rms);
+        // 예전 방식(최신 + 과거 최고 1장) — 섀도 비교용.
+        const double score_old = kept.empty()
+            ? latest_score
+            : 0.5 * (latest_score + kept.front());
+        // 새 방식: 유효 이력의 상위 비율.
+        double score_new = latest_score;
+        if (!kept.empty()) {
+            // 구간식: 소표본일수록 더 공격적으로 자른다. 복구 초반(작은 n)은
+            // 이력이 피의자인 레짐이라 전부 평균내면 정답이 드래그로 죽는다.
+            std::size_t take = kept.size();
+            if (kept.size() <= 4) {
+                take = std::max<std::size_t>(1, kept.size() / 2);
+            } else {
+                take = static_cast<std::size_t>(std::ceil(
+                    parameters_.history_support_fraction *
+                    static_cast<double>(kept.size())));
+                take = std::max<std::size_t>(1, std::min(take, kept.size()));
+            }
+            double total = latest_score;
+            for (std::size_t i = 0; i < take; ++i) {
+                total += kept[i];
+            }
+            score_new = total / static_cast<double>(take + 1);
+        }
+        // 후보에 뷰 통계를 실어 둔다 — 집계 후 순위가 바뀌므로 시드된 가설의
+        // 지지 패턴을 보려면 후보마다 들고 있어야 한다.
+        item.view_count = static_cast<std::uint8_t>(
+            std::min<std::size_t>(view_scores.size(), item.view_rms.size()));
+        for (std::size_t i = 0; i < item.view_count; ++i) {
+            item.view_rms[i] = view_scores[i] < 0.0
+                ? static_cast<float>(std::sqrt(-view_scores[i])) : 0.0f;
+            item.view_visible[i] = static_cast<float>(view_visible[i]);
+        }
+        if (!top_recorded) {
+            // shortlist는 아직 단일 스캔 점수 순이라 front가 그 기준 1등이다.
+            diagnostics_.top_score_old = score_old;
+            diagnostics_.top_score_new = score_new;
+            diagnostics_.top_view_count =
+                static_cast<std::uint8_t>(std::min<std::size_t>(
+                    view_scores.size(), diagnostics_.top_view_scores.size()));
+            diagnostics_.top_view_valid = diagnostics_.top_view_count;
+            for (std::size_t i = 0; i < diagnostics_.top_view_count; ++i) {
+                diagnostics_.top_view_scores[i] =
+                    static_cast<float>(view_scores[i]);
+                diagnostics_.top_view_visible[i] =
+                    static_cast<float>(view_visible[i]);
+            }
+            top_recorded = true;
+        }
+        item.score = parameters_.history_new_aggregate ? score_new : score_old;
+    }
+
+    // ---- 이력 가중 다수결 (결정 2) ----
+    //
+    // 뷰별 판정은 절대 컷이 아니라 '뷰 내부의 상대 비교'다. 씬마다 잔여 체인
+    // 오차가 전 뷰의 RMS를 일괄 상향시켜 지지/반대 대역이 씬 간에 겹치기
+    // 때문이다(실측: icra 지지 1.18~1.51 vs busan2 반대 1.50~2.36). 상대
+    // 비교는 그 상향이 모든 후보에 공통으로 걸리므로 자동 보정된다.
+    //
+    // 채점은 크기를 평균하므로 자격 미달 뷰를 경성 배제하고, 검증은 방향을
+    // 세므로 연성 가중을 쓴다 — 저가시 뷰도 약한 표를 던지되 평결을 좌우하지
+    // 못한다.
+    if (!shortlist.empty() && shortlist.front().view_count > 0) {
+        const std::size_t view_n = shortlist.front().view_count;
+        // 뷰별 최선(자격 쌍 중 최소 가시 RMS).
+        std::vector<double> view_best(view_n,
+                                      std::numeric_limits<double>::infinity());
+        for (const PoseCandidate &item : shortlist) {
+            for (std::size_t v = 0; v < view_n && v < item.view_count; ++v) {
+                if (item.view_visible[v] >= parameters_.history_min_visible_frac) {
+                    view_best[v] = std::min(
+                        view_best[v], static_cast<double>(item.view_rms[v]));
+                }
+            }
+        }
+        const double ramp_low = parameters_.history_weight_low_f;
+        const double ramp_high = parameters_.history_weight_high_f;
+        for (PoseCandidate &item : shortlist) {
+            double weight_sum = 0.0;
+            double pass_sum = 0.0;
+            for (std::size_t v = 0; v < view_n && v < item.view_count; ++v) {
+                // 아무도 설명 못 하는 뷰는 반대가 아니라 무의견이다.
+                if (!std::isfinite(view_best[v]) ||
+                    view_best[v] > parameters_.history_view_useless_m) {
+                    continue;
+                }
+                const double f = static_cast<double>(item.view_visible[v]);
+                const double w = std::clamp(
+                    (f - ramp_low) / std::max(1.0e-6, ramp_high - ramp_low),
+                    0.0, 1.0);
+                if (w <= 0.0) {
+                    continue;
+                }
+                const double band = std::max(
+                    parameters_.history_pass_ratio * view_best[v],
+                    view_best[v] + parameters_.history_pass_slack_m);
+                weight_sum += w;
+                if (static_cast<double>(item.view_rms[v]) <= band) {
+                    pass_sum += w;
+                }
+            }
+            item.support_weight = static_cast<float>(weight_sum);
+            item.support_ratio = weight_sum > 0.0
+                ? static_cast<float>(pass_sum / weight_sum) : 0.0f;
+        }
     }
 
     // 5) 공동 점수로 재정렬하고 표준 NMS로 가설을 반환합니다.
@@ -619,28 +941,25 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeTrajectory(
         h.score = used > 0 ? total / used : -50.0;
         hypotheses.push_back(h);
     }
-    std::sort(
-        hypotheses.begin(), hypotheses.end(),
-        [](const Hypothesis &a, const Hypothesis &b) {
-            return a.score > b.score;
-        });
-    diagnostics_.best_score = hypotheses.empty() ? 0.0 : hypotheses.front().score;
-    diagnostics_.scan_points = views.back().size();
-    // 궤적 정합 가설에도 같은 검증 게이트: 통과 후보만 시드가 됩니다.
-    for (Hypothesis &h : hypotheses) {
-        h.inlier = inlierFraction(h.x, h.y, h.yaw, views.back());
+    // 궤적 점수는 내부 탐색 휴리스틱으로만 쓰고, 최종 수락은 공통 관문에
+    // 맡긴다. 경로마다 점수 단위가 다르면 절대 하한과 상대 배율이 잴 것을
+    // 잃는다(실측: 궤적 joint=-7.13이 집계 RMS 2.67을 통과시킴).
+    std::vector<PoseCandidate> shortlist;
+    shortlist.reserve(hypotheses.size());
+    for (const Hypothesis &h : hypotheses) {
+        PoseCandidate candidate;
+        candidate.x = h.x;
+        candidate.y = h.y;
+        candidate.yaw = h.yaw;
+        // 표준 채점이 latest 가시 RMS로 다시 매기므로 초기값은 의미 없다.
+        candidate.score = 0.0;
+        shortlist.push_back(candidate);
     }
-    if (parameters_.hypothesis_verify_fraction > 0.0) {
-        std::vector<Hypothesis> gated;
-        gated.reserve(hypotheses.size());
-        for (const Hypothesis &h : hypotheses) {
-            if (h.inlier >= parameters_.hypothesis_verify_fraction) {
-                gated.push_back(h);
-            }
-        }
-        hypotheses = std::move(gated);
-    }
-    return hypotheses;
+    // 과거 뷰만 넘긴다(마지막이 latest).
+    std::vector<ScanView> past_views(views.begin(), views.end() - 1);
+    std::vector<RelativeMotion> past_offsets(
+        offsets.begin(), offsets.begin() + static_cast<long>(past_views.size()));
+    return finalizeCandidates(shortlist, views.back(), past_views, past_offsets);
 }
 
 geometry_msgs::msg::Pose Relocalization::relocalize(
