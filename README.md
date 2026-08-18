@@ -38,7 +38,7 @@ Set `map_loader.enabled: false` to subscribe to an external `map_server` instead
 | Direction | Topic | Type |
 |---|---|---|
 | in | `/scan` | `sensor_msgs/LaserScan` |
-| in | `/imu` | `sensor_msgs/Imu` |
+| in | `/imu/data` | `sensor_msgs/Imu` |
 | in | `/sensors/core` | `vesc_msgs/VescStateStamped` |
 | in | `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` |
 | out | `localization_pf/pose` | `geometry_msgs/PoseWithCovarianceStamped` |

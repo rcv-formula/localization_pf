@@ -13,7 +13,7 @@
     # IO — 토픽 · 프레임 · 출력
     # ==================================================================
     scan_topic: /scan
-    imu_topic: /imu
+    imu_topic: /imu/data
     map_topic: /map
     # RViz "2D Pose Estimate" 도구가 발행하는 토픽. 사람이 아는 위치를 직접
     # 넣는 입구이며, 전역 relocalization 을 대체하지 않습니다(둘 다 살아 있음).

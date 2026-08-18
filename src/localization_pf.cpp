@@ -166,7 +166,7 @@ void mainNode::declareParameters() {
   vesc_state_topic_ = this->declare_parameter<std::string>(
     "vesc_state_topic", "/sensors/core");
   scan_topic_ = this->declare_parameter<std::string>("scan_topic", "/scan");
-  imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu");
+  imu_topic_ = this->declare_parameter<std::string>("imu_topic", "/imu/data");
   map_topic_ = this->declare_parameter<std::string>("map_topic", "/map");
   odom_topic_ = this->declare_parameter<std::string>("odom_topic", "/odom");
   // 자체 맵 로더. map_dir는 보통 launch가 패키지 map 폴더로 주입합니다.
