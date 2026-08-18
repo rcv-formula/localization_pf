@@ -236,6 +236,20 @@ class particlePropagation{
     const MotionDelta &lastMotionDelta() const { return last_motion_delta_; }
     // 궤적 버퍼 최신 샘플의 시각[s]. 출력 보간이 얼마나 오래된 데이터를
     // 쓰는지(보간 레이턴시) 측정용. 버퍼가 비면 음수.
+    // EKF 건강 진단 스냅샷. 휠 innovation은 누적합/카운트로 내보내고
+    // 호출부가 창 단위 rms를 만든다(직전 값과의 차분).
+    struct EkfDiagnostics {
+        double velocity{0.0};
+        double velocity_std{0.0};
+        double gyro_z_bias{0.0};
+        double accel_x_bias{0.0};
+        double accel_y_bias{0.0};
+        double roll_deg{0.0};
+        double pitch_deg{0.0};
+        double wheel_innov_sq_sum{0.0};
+        uint64_t wheel_innov_count{0};
+    };
+    EkfDiagnostics ekfDiagnostics() const;
     double newestTrajectoryTime() const {
         return trajectory_.empty() ? -1.0 : trajectory_.back().time;
     }
@@ -430,6 +444,9 @@ class particlePropagation{
     // ERPM 경로 적분 상태: 직전 샘플 시각과 누적 주행거리[m].
     double erpm_prev_stamp_{-1.0};
     double erpm_cumulative_distance_{0.0};
+    // 휠 속도 innovation(측정-예측, 데드존 전) 누적 — EKF 검진용.
+    double wheel_innov_sq_sum_{0.0};
+    uint64_t wheel_innov_count_{0};
     double last_yaw_rate_{0.0};
     double last_yaw_accel_{0.0};
     double last_rear_accel_x_{0.0};

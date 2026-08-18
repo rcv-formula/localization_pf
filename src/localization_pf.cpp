@@ -2841,6 +2841,39 @@ void mainNode::output_timer_callback() {
   // 벤치마크용: 보간 레이턴시(지금 시각 - 궤적 최신 샘플 시각)와 직전 PF
   // 처리 시간을 함께 발행합니다. 출력이 비동기 보간이므로 이 합이 체감
   // 레이턴시에 해당합니다.
+  // EKF 검진 로그(5초). 상태 변수는 순간값을, 휠 innovation은 직전 로그
+  // 이후 창의 rms를 찍습니다. 바이어스가 단조로 걷거나 innovation rms가
+  // 커지면 EKF가 어딘가의 모순을 상태로 흡수하고 있다는 뜻입니다.
+  if (propagation_) {
+    // 수동 스로틀. RCLCPP_INFO_THROTTLE 안에서 창 기준(prev_*)을 갱신하면
+    // 매크로는 출력만 거르고 갱신은 매 틱 실행돼, 로그에 찍히는 창이 5초가
+    // 아니라 직전 10 ms가 된다(실측: n이 0~1로 나와 휠 업데이트가 죽은 것처럼
+    // 보였다). 창 갱신과 출력이 같은 조건 아래 있어야 한다.
+    static double prev_sq = 0.0;
+    static uint64_t prev_n = 0;
+    static double last_log_s = -1.0e18;
+    const double now_s = stamp.seconds();
+    if (now_s - last_log_s >= 5.0) {
+      last_log_s = now_s;
+      const auto diag = propagation_->ekfDiagnostics();
+      const uint64_t dn = diag.wheel_innov_count - prev_n;
+      const double rms = dn > 0 ?
+        std::sqrt(
+          (diag.wheel_innov_sq_sum - prev_sq) / static_cast<double>(dn))
+        : 0.0;
+      RCLCPP_INFO(
+        this->get_logger(),
+        "ekf: v %.2f (std %.2f) | wheel innov rms %.3f m/s (n %lu) | "
+        "bias gyro %.5f accel (%.3f, %.3f) | tilt r/p (%.2f, %.2f) deg",
+        diag.velocity, diag.velocity_std, rms,
+        static_cast<unsigned long>(dn),
+        diag.gyro_z_bias, diag.accel_x_bias, diag.accel_y_bias,
+        diag.roll_deg, diag.pitch_deg);
+      prev_sq = diag.wheel_innov_sq_sum;
+      prev_n = diag.wheel_innov_count;
+    }
+  }
+
   const double newest = propagation_ ? propagation_->newestTrajectoryTime() : -1.0;
   if (latency_pub_ && newest > 0.0) {
     std_msgs::msg::Float32MultiArray message;

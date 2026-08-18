@@ -422,6 +422,24 @@ void particlePropagation::resetPropagationReference() {
     has_propagation_reference_ = false;
 }
 
+particlePropagation::EkfDiagnostics particlePropagation::ekfDiagnostics() const {
+    EkfDiagnostics diag;
+    if (!ekf_initialized_) {
+        return diag;
+    }
+    diag.velocity = ekf_state_(kVelocity);
+    diag.velocity_std =
+        std::sqrt(std::max(0.0, ekf_covariance_(kVelocity, kVelocity)));
+    diag.gyro_z_bias = ekf_state_(kGyroZBias);
+    diag.accel_x_bias = ekf_state_(kAccelXBias);
+    diag.accel_y_bias = ekf_state_(kAccelYBias);
+    diag.roll_deg = ekf_state_(kRoll) / kDegToRad;
+    diag.pitch_deg = ekf_state_(kPitch) / kDegToRad;
+    diag.wheel_innov_sq_sum = wheel_innov_sq_sum_;
+    diag.wheel_innov_count = wheel_innov_count_;
+    return diag;
+}
+
 void particlePropagation::resetDynamicState() {
     if (!ekf_initialized_) {
         return;
@@ -951,6 +969,8 @@ void particlePropagation::processWheelMeasurementsUpTo(
         jacobian(kVelocity) = 1.0;
 
         double velocity_residual = measured_velocity - ekf_state_(kVelocity);
+        wheel_innov_sq_sum_ += square(velocity_residual);
+        ++wheel_innov_count_;
         if (std::abs(ekf_state_(kVelocity)) < ekf_params_.velocity_deadzone &&
             std::abs(measured_velocity) < ekf_params_.velocity_deadzone) {
             velocity_residual = 0.0;
@@ -1787,6 +1807,8 @@ void particlePropagation::applyWheelMeasurementAtTime(
     jacobian(kVelocity) = 1.0;
 
     double velocity_residual = measured_velocity - ekf_state_(kVelocity);
+    wheel_innov_sq_sum_ += square(velocity_residual);
+    ++wheel_innov_count_;
     if (std::abs(ekf_state_(kVelocity)) < ekf_params_.velocity_deadzone &&
         std::abs(measured_velocity) < ekf_params_.velocity_deadzone) {
         velocity_residual = 0.0;
