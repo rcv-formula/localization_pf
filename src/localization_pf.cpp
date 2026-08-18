@@ -2292,12 +2292,44 @@ void mainNode::runFilterCycle(const sensor_msgs::msg::LaserScan &scan) {
   ScanDeskew::Result deskewed;
   sensor_msgs::msg::LaserScan corrected = scan;
   double reference_time = stampToSeconds(scan.header.stamp);
-  if (deskew_.deskew(scan, pose_lookup, deskewed) && deskewed.valid) {
+  const bool deskew_ok = deskew_.deskew(scan, pose_lookup, deskewed) &&
+    deskewed.valid;
+  if (deskew_ok) {
     reference_time = deskewed.reference_time;
     // 기존 LaserScan 소비자를 위해 균일 각도 격자로 되담습니다(근사).
     if (!ScanDeskew::toLaserScan(deskewed, scan, corrected)) {
       corrected = scan;
     }
+  }
+  // deskew 관측 계측. 이 경로는 성공/실패도, 보정량도 어디에도 남지 않아
+  // "잘 되는지"를 물을 방법이 없었다. 스윕 동안의 yaw 변화가 곧 보정해야 할
+  // 왜곡량이므로 그것을 함께 집계한다(1081빔 x 17.4us = 18.8ms 스윕).
+  {
+    static uint32_t ok_count = 0;
+    static uint32_t fail_count = 0;
+    static double yaw_sum = 0.0;
+    static double yaw_max = 0.0;
+    if (deskew_ok) {
+      ++ok_count;
+      const double sweep = static_cast<double>(scan.time_increment) *
+        static_cast<double>(scan.ranges.empty() ? 0 : scan.ranges.size() - 1);
+      double x0, y0, yaw0, x1, y1, yaw1;
+      if (sweep > 0.0 &&
+          pose_lookup(stampToSeconds(scan.header.stamp), x0, y0, yaw0) &&
+          pose_lookup(stampToSeconds(scan.header.stamp) + sweep, x1, y1, yaw1)) {
+        const double dyaw =
+          std::abs(normalizeAngle(yaw1 - yaw0)) * 180.0 / kPi;
+        yaw_sum += dyaw;
+        yaw_max = std::max(yaw_max, dyaw);
+      }
+    } else {
+      ++fail_count;
+    }
+    RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 5000,
+      "deskew: ok %u fail %u | sweep yaw avg %.2f max %.2f deg",
+      ok_count, fail_count,
+      ok_count > 0 ? yaw_sum / ok_count : 0.0, yaw_max);
   }
   const builtin_interfaces::msg::Time reference_stamp = secondsToStamp(reference_time);
 
