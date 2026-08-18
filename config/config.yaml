@@ -419,7 +419,7 @@
       majority_probation: 0.25
       probation_mass: 0.3
       # 데드락 보험: 전원 거부가 이 시간을 넘으면 최선 후보를 보호관찰로 승격.
-      majority_escape_s: 5.0
+      majority_escape_s: 3.0
 
       # --- 수동 시드(RViz 2D Pose Estimate) ---
       # 사람이 찍은 직후 이 시간 동안 전역 탐색을 멈춥니다. 필터가 그 자리에서
@@ -432,7 +432,12 @@
       manual_seed_min_pos_std: 0.20
       manual_seed_min_yaw_std: 0.09
       multi_scan_count: 12
-      multi_scan_spacing_m: 0.5
+      # 이력 '저장' 용량(장). 사용 장수(multi_scan_count-1=11)와 분리 — 저장은
+      # 0.1 m 간격으로 조밀하게 하고, 탐색 시 그중 기하적으로 가장 퍼진 11장을
+      # 고른다. 서행에서도 뷰가 빨리 차고(증거 굶주림 소멸), 이동이 쌓이면
+      # 스팬이 자동 복원된다. 60 x 0.1 m = 6 m > 노후 컷 4 m.
+      multi_scan_buffer: 60
+      multi_scan_spacing_m: 0.1
       multi_scan_spacing_deg: 15.0
       multi_scan_top_candidates: 64
       # --- 궤적-모양 전역 정합 ---

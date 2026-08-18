@@ -304,6 +304,10 @@ private:
   // 단일 스캔은 닮은꼴 복도/루프를 구분하지 못하므로(0526-1 전역 앨리어스)
   // 주행 중 모아둔 과거 스캔들을 DR 상대이동으로 묶어 공동 채점합니다.
   int multi_scan_count_{12};
+  // 이력 '저장' 용량. 사용 장수(multi_scan_count)와 분리한다 — 저장은 조밀하게
+  // (0.1 m 간격, 서행에서도 증거가 굶지 않게), 사용은 그중 기하적으로 퍼진
+  // 부분집합만. 60장 x 0.1 m = 최대 6 m 스팬으로, 검색 측 노후 컷(4 m)을 덮는다.
+  int multi_scan_buffer_{60};
   double multi_scan_spacing_m_{0.5};
   double multi_scan_spacing_deg_{15.0};
   // ---- 맵 정합성 감시 (off-map) ----
@@ -393,6 +397,10 @@ private:
   // 나쁜 경우, 수동 시드로 Lost 를 빠져나가면 그 future 가 수확되지 않은
   // 채 남았다가 다음 Lost 에서 낡은 결과로 시드됩니다.
   bool reloc_discard_result_{false};
+  // 탐색 요청을 만든 시점의 뷰별 자세[deg] (roll, pitch). 워커가 도는 동안
+  // scan_history_ 는 계속 갱신되므로, 수확 시점에 그걸 읽으면 요청에 실린
+  // 뷰와 어긋납니다. reloc_anchor_* 와 같은 이유로 요청 시점에 떠 둡니다.
+  std::vector<std::array<double, 2>> reloc_view_tilt_;
   // 탐색을 시작한 순간의 라이다 DR pose. 탐색이 도는 동안에도 EKF는 계속
   // 전진하므로, 수확 시점에 그만큼의 이동을 가설에 합성해야 시드가 현재
   // 시각과 맞습니다. (동기 구현에서는 executor가 막혀 EKF도 함께 멈췄기
@@ -468,6 +476,12 @@ private:
     double x{0.0};
     double y{0.0};
     double yaw{0.0};
+    // 스냅샷 시점의 차대 자세(시동 자세 대비 상대)[deg]. 2D 라이다는 차대에
+    // 고정돼 있으므로 roll/pitch 가 곧 스캔 평면의 기울기이고, 뷰마다 다른
+    // 평면을 본 것을 같은 평면으로 취급하면 뷰별 RMS 가 pose 오차가 아니라
+    // 자세 차이를 재게 됩니다. yaw 만으로는 이 정보가 남지 않습니다.
+    double roll_deg{0.0};
+    double pitch_deg{0.0};
   };
   std::deque<ScanSnapshot> scan_history_;
   // 궤적 정합용 라이다 DR pose 이력(0.3 m 간격, 최근 trajectory_fit_history_m).

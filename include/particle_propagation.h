@@ -190,6 +190,11 @@ class particlePropagation{
     // 기준 자세 대비 상대 기울기[deg] 중 큰 쪽(roll/pitch). 기준이 아직
     // 잡히지 않았으면 0. 전복/들림 구간의 스캔을 이력에서 빼는 데 씁니다.
     double relativeTiltDeg() const;
+    // 같은 기준 대비 상대 roll/pitch 를 부호까지 따로 돌려줍니다[deg].
+    // relativeTiltDeg 는 두 축의 최대 크기만 주므로 "어느 축으로 얼마나"
+    // 기울었는지가 사라집니다. 이력 스냅샷에 자세를 남기려면 축별 값이
+    // 필요합니다(라이다 평면이 어느 방향으로 틀어졌는지가 뷰마다 다름).
+    void relativeTilt(double &roll_deg, double &pitch_deg) const;
     TrajectoryPose poseAt(double target_seconds) const;
     TrajectoryPose poseAt(builtin_interfaces::msg::Time target_time) const;
 

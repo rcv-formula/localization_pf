@@ -341,6 +341,8 @@ void mainNode::declareParameters() {
     "tracking.converge_raw_cap_factor", 3.0));
   score_fail_threshold_ = this->declare_parameter<double>(
     "tracking.score_fail_threshold", -9.0);
+  multi_scan_buffer_ = std::max<int>(2, this->declare_parameter<int>(
+    "relocalization.multi_scan_buffer", 60));
   multi_scan_count_ = std::max<int>(2, this->declare_parameter<int>(
     "relocalization.multi_scan_count", 12));
   multi_scan_spacing_m_ = std::max(0.05, this->declare_parameter<double>(
@@ -1296,9 +1298,20 @@ bool mainNode::harvestRelocalization() {
         views += "/";
         views += std::to_string(
           static_cast<int>(std::lround(h.view_visible[v] * 100.0)));
+        // 그 뷰를 찍을 때의 차대 기울기. 뷰별 RMS 가 나쁠 때 그것이 pose
+        // 오차인지 스캔 평면이 틀어진 탓인지 구분하려면 함께 봐야 합니다.
+        if (v < reloc_view_tilt_.size()) {
+          views += "/";
+          views += std::to_string(
+            static_cast<int>(std::lround(reloc_view_tilt_[v][0])));
+          views += ",";
+          views += std::to_string(
+            static_cast<int>(std::lround(reloc_view_tilt_[v][1])));
+        }
       }
       RCLCPP_INFO(
-        this->get_logger(), "  hypo[%zu] views RMScm/vis%%: [%s]",
+        this->get_logger(),
+        "  hypo[%zu] views RMScm/vis%%/roll,pitch deg: [%s]",
         index, views.c_str());
     }
   }
@@ -1446,6 +1459,10 @@ void mainNode::updateScanHistory(const sensor_msgs::msg::LaserScan &scan) {
     sin_yaw * laser_extrinsic_.rear_to_laser_x +
     cos_yaw * laser_extrinsic_.rear_to_laser_y;
   snapshot.yaw = sample.yaw;
+  // 자세도 함께 남깁니다. 아래 tilt 게이트가 '너무 기운' 스냅샷을 버리긴
+  // 하지만, 통과한 스냅샷들도 서로 기울기가 다릅니다 — 그 차이가 뷰별
+  // RMS 에 섞여 들어오므로 진단에서 분리해 볼 수 있어야 합니다.
+  propagation_->relativeTilt(snapshot.roll_deg, snapshot.pitch_deg);
 
   // 궤적 정합용 pose 이력은 multi-scan과 독립적으로 쌓습니다.
   if (pose_history_.empty() ||
@@ -1494,8 +1511,10 @@ void mainNode::updateScanHistory(const sensor_msgs::msg::LaserScan &scan) {
   }
   snapshot.scan = scan;
   scan_history_.push_back(std::move(snapshot));
-  const std::size_t keep = static_cast<std::size_t>(
-    std::max(1, multi_scan_count_ - 1));
+  // 저장은 사용 장수와 무관하게 조밀 버퍼를 유지한다. 탐색 요청을 만들 때
+  // 이 중 기하적으로 퍼진 부분집합을 고른다(selectHistoryViews).
+  const std::size_t keep = static_cast<std::size_t>(std::max(
+    std::max(1, multi_scan_count_ - 1), multi_scan_buffer_));
   while (scan_history_.size() > keep) {
     scan_history_.pop_front();
   }
@@ -1691,15 +1710,117 @@ mainNode::GlobalSearchRequest mainNode::buildGlobalSearchRequest(
 
   // 스캔 이력 + 현재 스캔을 relocalizeMultiple/Trajectory 공용 체인으로
   // 접습니다. 연속 라이다 pose a->b의 상대 이동(a 프레임 기준)입니다.
+  //
+  // 이력은 조밀 버퍼(0.1 m 간격, 최대 multi_scan_buffer장)에서 최대
+  // multi_scan_count-1장을 '기하적으로 퍼지게' 골라 씁니다. 판별력은 장수가
+  // 아니라 시점 다양성(베이스라인)에서 나옵니다 — 직선 1 m 위의 11장은 서로
+  // 상관된 표본이라 한 표나 다름없지만, 코너를 낀 3장은 앨리어스를 강하게
+  // 자릅니다. 조밀 저장 덕에 서행에서도 뷰가 빨리 차고(증거 굶주림으로 인한
+  // majority escape 소멸), 이동이 쌓이면 선택이 자동으로 넓은 스팬을 복원해
+  // 같은 비용(<=11장 채점)으로 양쪽을 다 얻습니다.
   if (pose_ok) {
+    // 후보: 현재 pose에서 노후 컷(history_valid_dr_max_m) 이내의 뷰만.
+    // 검색 측이 어차피 그 밖의 뷰를 버리므로 슬롯을 낭비하지 않습니다.
+    std::vector<std::size_t> eligible;
+    eligible.reserve(scan_history_.size());
+    const double dr_max = relocalization_parameters_.history_valid_dr_max_m;
+    for (std::size_t i = 0; i < scan_history_.size(); ++i) {
+      const ScanSnapshot &snapshot = scan_history_[i];
+      if (dr_max > 0.0 &&
+          std::hypot(snapshot.x - laser_x, snapshot.y - laser_y) > dr_max) {
+        continue;
+      }
+      eligible.push_back(i);
+    }
+
+    // greedy farthest-point 선택(SE(2)). 거리 = 평면거리 + 1.8 * |dyaw| —
+    // 1.8 m/rad 는 가설 분리 NMS(0.8 m / 25도)와 같은 환산입니다. 현재
+    // pose를 고정 앵커로 두고 시작하므로 '지금'과 겹치는 뷰는 밀려납니다.
+    const std::size_t want = static_cast<std::size_t>(
+      std::max(1, multi_scan_count_ - 1));
+    std::vector<std::size_t> selected;
+    if (eligible.size() <= want) {
+      selected = eligible;
+    } else {
+      constexpr double kYawWeight = 1.8;
+      auto se2_dist = [&](std::size_t a, double bx, double by, double byaw) {
+        const ScanSnapshot &va = scan_history_[a];
+        return std::hypot(va.x - bx, va.y - by) +
+          kYawWeight * std::abs(normalizeAngle(va.yaw - byaw));
+      };
+      std::vector<double> min_dist(eligible.size());
+      for (std::size_t e = 0; e < eligible.size(); ++e) {
+        min_dist[e] = se2_dist(eligible[e], laser_x, laser_y, laser_yaw);
+      }
+      std::vector<bool> taken(eligible.size(), false);
+      selected.reserve(want);
+      for (std::size_t round = 0; round < want; ++round) {
+        std::size_t best = eligible.size();
+        double best_dist = -1.0;
+        for (std::size_t e = 0; e < eligible.size(); ++e) {
+          if (!taken[e] && min_dist[e] > best_dist) {
+            best_dist = min_dist[e];
+            best = e;
+          }
+        }
+        if (best == eligible.size()) {
+          break;
+        }
+        taken[best] = true;
+        selected.push_back(eligible[best]);
+        const ScanSnapshot &vb = scan_history_[eligible[best]];
+        for (std::size_t e = 0; e < eligible.size(); ++e) {
+          if (!taken[e]) {
+            min_dist[e] = std::min(
+              min_dist[e], se2_dist(eligible[e], vb.x, vb.y, vb.yaw));
+          }
+        }
+      }
+      // 체인은 시간 순서를 전제하므로 정렬해 되돌립니다.
+      std::sort(selected.begin(), selected.end());
+    }
+
+    // 선택 진단: 몇 장을 어떤 스팬으로 쓰는지. 적은 장수로 통과하는지,
+    // 정보가 모일 때까지 기다리는지가 여기서 읽힙니다.
+    {
+      double span = 0.0;
+      double yaw_spread = 0.0;
+      for (std::size_t a = 0; a < selected.size(); ++a) {
+        for (std::size_t b = a + 1; b < selected.size(); ++b) {
+          const ScanSnapshot &va = scan_history_[selected[a]];
+          const ScanSnapshot &vb = scan_history_[selected[b]];
+          span = std::max(span, std::hypot(va.x - vb.x, va.y - vb.y));
+          yaw_spread = std::max(yaw_spread,
+            std::abs(normalizeAngle(va.yaw - vb.yaw)));
+        }
+      }
+      RCLCPP_INFO(
+        this->get_logger(),
+        "history views: %zu of %zu buffered (%zu eligible), span %.1f m / "
+        "%.0f deg",
+        selected.size(), scan_history_.size(), eligible.size(),
+        span, yaw_spread * 180.0 / kPi);
+    }
+
     std::vector<std::array<double, 3>> chain;
-    chain.reserve(scan_history_.size() + 1);
-    for (const ScanSnapshot &snapshot : scan_history_) {
+    chain.reserve(selected.size() + 1);
+    reloc_view_tilt_.clear();
+    reloc_view_tilt_.reserve(selected.size() + 1);
+    for (const std::size_t index : selected) {
+      const ScanSnapshot &snapshot = scan_history_[index];
       request.scans.push_back(snapshot.scan);
       chain.push_back({snapshot.x, snapshot.y, snapshot.yaw});
+      reloc_view_tilt_.push_back({snapshot.roll_deg, snapshot.pitch_deg});
     }
     request.scans.push_back(scan);
     chain.push_back({laser_x, laser_y, laser_yaw});
+    {
+      // 마지막 뷰는 현재 스캔이므로 지금 자세를 씁니다.
+      double roll_now = 0.0;
+      double pitch_now = 0.0;
+      propagation_->relativeTilt(roll_now, pitch_now);
+      reloc_view_tilt_.push_back({roll_now, pitch_now});
+    }
     request.motions.reserve(chain.size() - 1);
     for (std::size_t index = 0; index + 1 < chain.size(); ++index) {
       const double delta_x = chain[index + 1][0] - chain[index][0];

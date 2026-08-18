@@ -1488,6 +1488,18 @@ bool particlePropagation::chassisTiltFromImu(
     return true;
 }
 
+void particlePropagation::relativeTilt(double &roll_deg, double &pitch_deg) const {
+    if (!dr_tilt_reference_valid_) {
+        roll_deg = 0.0;
+        pitch_deg = 0.0;
+        return;
+    }
+    roll_deg =
+        normalizeAngle(last_dr_tilt_roll_ - dr_tilt_reference_roll_) / kDegToRad;
+    pitch_deg =
+        normalizeAngle(last_dr_tilt_pitch_ - dr_tilt_reference_pitch_) / kDegToRad;
+}
+
 double particlePropagation::relativeTiltDeg() const {
     if (!dr_tilt_reference_valid_) {
         return 0.0;
