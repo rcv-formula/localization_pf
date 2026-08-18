@@ -531,6 +531,17 @@ private:
   // 위 재료를 하나로 합친 신뢰도 [0,1]. 약한 고리(min) 방식이라 어느 하나가
   // 나빠지면 값이 떨어집니다.
   double localizationConfidence() const;
+  // 신뢰도의 재료 5항(각 [0,1], 상태 배율 적용 전). min이 어느 항인지가
+  // 소비자에게 중요하다 — "모호해서 낮음"(mass)과 "정합이 나빠서 낮음"(score)
+  // 은 반대 대응을 요구한다(참을성 있는 대기 vs 즉시 기각).
+  struct ConfidenceTerms {
+    double score{1.0};
+    double outlier{1.0};
+    double skip{1.0};
+    double spread{1.0};
+    double mass{1.0};
+  };
+  ConfidenceTerms confidenceTerms() const;
   // beam skip 시각화: 스킵된 빔만 담은 LaserScan(나머지 NaN).
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr skipped_scan_pub_;
   // 0=Lost, 1=Converging, 2=Tracking. transient_local이라 늦게 붙는 상위

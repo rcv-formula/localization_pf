@@ -2918,30 +2918,35 @@ void mainNode::publishTransforms(const rclcpp::Time &stamp) {
 // 약한 고리(min) 방식 — 어느 한 축이 무너지면 전체가 내려갑니다. 로그우도
 // 하나로는 판별이 안 되므로(맵/빔 수에 따라 절대값이 달라짐) 정규화된 정합도,
 // 불일치 빔 비율, 구름 퍼짐, 가설 확정도를 함께 봅니다.
-double mainNode::localizationConfidence() const {
+mainNode::ConfidenceTerms mainNode::confidenceTerms() const {
+  ConfidenceTerms terms;
   // (1) 스캔 정합도 — 이미 [0,1]로 정규화된 값
-  const double score_term = last_score_health_;
+  terms.score = last_score_health_;
 
   // (2) 불일치 빔 비율 — good 이하면 1, bad 이상이면 0
   const double frac_span = outlier_frac_bad_ - outlier_frac_good_;
-  const double outlier_term = frac_span > 1.0e-9 ?
+  terms.outlier = frac_span > 1.0e-9 ?
     1.0 - std::clamp(
       (last_outlier_fraction_ - outlier_frac_good_) / frac_span, 0.0, 1.0) : 1.0;
 
   // (3) beam skip 제안 비율 — 위치 상실 문턱에 가까울수록 0으로
-  const double skip_term = beamskip_lost_fraction_ > 1.0e-9 ?
+  terms.skip = beamskip_lost_fraction_ > 1.0e-9 ?
     1.0 - std::clamp(last_skip_fraction_ / beamskip_lost_fraction_, 0.0, 1.0) : 1.0;
 
   // (4) 파티클 구름 퍼짐 — 0.3 m에서 0.5가 되도록 사상
   constexpr double kSigmaRef = 0.3;
-  const double spread_term = kSigmaRef * kSigmaRef /
+  terms.spread = kSigmaRef * kSigmaRef /
     (kSigmaRef * kSigmaRef + last_pos_sigma_ * last_pos_sigma_);
 
   // (5) 지배 가설 질량 — 여러 가설이 살아 있으면 그만큼 불확실
-  const double mass_term = std::clamp(last_dominant_mass_, 0.0, 1.0);
+  terms.mass = std::clamp(last_dominant_mass_, 0.0, 1.0);
+  return terms;
+}
 
+double mainNode::localizationConfidence() const {
+  const ConfidenceTerms terms = confidenceTerms();
   const double weakest = std::min(
-    {score_term, outlier_term, skip_term, spread_term, mass_term});
+    {terms.score, terms.outlier, terms.skip, terms.spread, terms.mass});
 
   // 상태로 최종 배율: Lost면 0, 판별 중이면 절반.
   double state_factor = 1.0;
@@ -3024,18 +3029,26 @@ void mainNode::publishPose(const rclcpp::Time &stamp) {
   // pose와 정확히 짝지을 수 있게 합니다. 배열 의미는 layout.dim 라벨 참고.
   if (confidence_pub_) {
     std_msgs::msg::Float64MultiArray conf;
-    conf.layout.dim.resize(3);
-    const char *labels[3] = {"stamp_sec", "stamp_nanosec", "confidence"};
-    for (std::size_t i = 0; i < 3; ++i) {
+    // 앞 3칸(data[0..2])은 동결 계약입니다 — 기존 소비자는 그대로 동작.
+    // 뒤 5칸은 신뢰도의 재료 항(각 [0,1], 상태 배율 전)입니다. min 하나로는
+    // "모호해서 낮음"(mass)과 "정합이 나빠서 낮음"(score)이 구분되지 않는데,
+    // 둘은 반대 대응(참을성 있는 대기 vs 즉시 기각)을 요구합니다.
+    conf.layout.dim.resize(8);
+    const char *labels[8] = {
+      "stamp_sec", "stamp_nanosec", "confidence",
+      "term_score", "term_outlier", "term_skip", "term_spread", "term_mass"};
+    for (std::size_t i = 0; i < 8; ++i) {
       conf.layout.dim[i].label = labels[i];
       conf.layout.dim[i].size = 1;
       conf.layout.dim[i].stride = 1;
     }
     const int64_t total_ns = stamp.nanoseconds();
+    const ConfidenceTerms terms = confidenceTerms();
     conf.data = {
       static_cast<double>(total_ns / 1000000000LL),
       static_cast<double>(total_ns % 1000000000LL),
-      localizationConfidence()};
+      localizationConfidence(),
+      terms.score, terms.outlier, terms.skip, terms.spread, terms.mass};
     confidence_pub_->publish(conf);
   }
 }
