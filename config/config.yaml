@@ -15,6 +15,9 @@
     scan_topic: /scan
     imu_topic: /imu
     map_topic: /map
+    # RViz "2D Pose Estimate" 도구가 발행하는 토픽. 사람이 아는 위치를 직접
+    # 넣는 입구이며, 전역 relocalization 을 대체하지 않습니다(둘 다 살아 있음).
+    initialpose_topic: /initialpose
     vesc_state_topic: /sensors/core
     # 최종 결과(map 기준 base_link pose)를 nav_msgs/Odometry로 내보낼 토픽.
     # 관례상 /odom은 휠 오돔에 쓰이므로 충돌하는 스택에서는 이름을 바꾸세요.
@@ -417,6 +420,17 @@
       probation_mass: 0.3
       # 데드락 보험: 전원 거부가 이 시간을 넘으면 최선 후보를 보호관찰로 승격.
       majority_escape_s: 5.0
+
+      # --- 수동 시드(RViz 2D Pose Estimate) ---
+      # 사람이 찍은 직후 이 시간 동안 전역 탐색을 멈춥니다. 필터가 그 자리에서
+      # 수렴할 시간을 주기 위한 것이고, 유예가 끝나면 자동 복구가 평소대로
+      # 돌아오므로 잘못 찍어도 영구히 갇히지 않습니다. 0 이면 유예 없음.
+      manual_seed_grace_s: 5.0
+      # RViz covariance -> 파티클 퍼짐의 하한. filter.init_*_std(10 cm / 2.9도)는
+      # 검증된 전역 탐색 시드용이라 사람 클릭에는 지나치게 좁습니다. RViz 설정에
+      # 따라 covariance 가 0 으로 실려 오기도 해서 하한이 필요합니다.
+      manual_seed_min_pos_std: 0.20
+      manual_seed_min_yaw_std: 0.09
       multi_scan_count: 12
       multi_scan_spacing_m: 0.5
       multi_scan_spacing_deg: 15.0

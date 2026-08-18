@@ -136,6 +136,10 @@ mainNode::mainNode()
   // 센서 입력은 best-effort로 받습니다. reliable 구독자는 best-effort 퍼블리셔의
   // 메시지를 아예 받지 못하지만(QoS 비호환), best-effort 구독자는 reliable
   // 퍼블리셔의 것도 받습니다. 드라이버/재생기 어느 쪽에도 붙으려면 이쪽입니다.
+  initialpose_sub_ =
+    this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      initialpose_topic_, 1,
+      std::bind(&mainNode::initialpose_callback, this, std::placeholders::_1));
   scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
     scan_topic_, rclcpp::SensorDataQoS().keep_last(10),
     std::bind(&mainNode::scan_callback, this, std::placeholders::_1));
@@ -169,6 +173,15 @@ void mainNode::declareParameters() {
   map_loader_enabled_ = this->declare_parameter<bool>("map_loader.enabled", true);
   map_loader_dir_ = this->declare_parameter<std::string>("map_loader.map_dir", "");
   map_loader_name_ = this->declare_parameter<std::string>("map_loader.map_name", "map");
+  // RViz "2D Pose Estimate" 입력.
+  initialpose_topic_ = this->declare_parameter<std::string>(
+    "initialpose_topic", "/initialpose");
+  manual_seed_grace_s_ = std::max(0.0, this->declare_parameter<double>(
+    "relocalization.manual_seed_grace_s", 5.0));
+  manual_seed_min_pos_std_ = std::max(0.01, this->declare_parameter<double>(
+    "relocalization.manual_seed_min_pos_std", 0.20));
+  manual_seed_min_yaw_std_ = std::max(0.005, this->declare_parameter<double>(
+    "relocalization.manual_seed_min_yaw_std", 0.09));
   map_frame_ = this->declare_parameter<std::string>("frames.map", "map");
   odom_frame_ = this->declare_parameter<std::string>("frames.odom", "odom");
   base_frame_ = this->declare_parameter<std::string>("frames.base", "base_link");
@@ -838,6 +851,84 @@ void mainNode::vesc_state_callback(const vesc_msgs::msg::VescStateStamped::Share
   propagation_->wheelGetter(*msg);
 }
 
+// RViz "2D Pose Estimate"로 사람이 직접 위치를 지정하는 입구입니다.
+// 전역 relocalization 을 대체하지 않습니다 — 자동 탐색은 그대로 살아 있고,
+// 이건 "사람이 답을 알고 있을 때 그 답을 넣는" 별도 경로입니다.
+void mainNode::initialpose_callback(
+  const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg) {
+  if (!relocalization_) {
+    RCLCPP_WARN(
+      this->get_logger(),
+      "manual seed ignored: map not ready yet");
+    return;
+  }
+
+  // RViz 는 자신의 Fixed Frame 으로 발행합니다. 맵 프레임이 아니면 좌표가
+  // 전혀 다른 뜻이므로 조용히 받아들이면 안 됩니다 — 어디로 찍히는지
+  // 알 수 없는 시드가 됩니다.
+  std::string frame = msg->header.frame_id;
+  if (!frame.empty() && frame.front() == '/') {
+    frame.erase(frame.begin());
+  }
+  if (!frame.empty() && frame != map_frame_) {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "manual seed ignored: frame '%s' is not the map frame '%s' — "
+      "set RViz Fixed Frame to '%s'",
+      msg->header.frame_id.c_str(), map_frame_.c_str(), map_frame_.c_str());
+    return;
+  }
+
+  const double x = msg->pose.pose.position.x;
+  const double y = msg->pose.pose.position.y;
+  const double yaw = tf2::getYaw(msg->pose.pose.orientation);
+
+  // RViz 도구가 실어 보내는 covariance 를 퍼짐으로 씁니다. 사람 클릭의
+  // 불확실성은 검증된 전역 탐색 시드보다 훨씬 크므로 filter.init_*_std
+  // (10 cm / 2.9 deg)를 그대로 쓰면 틀린 자리에 못박혀 수렴할 여지가
+  // 없습니다. 0 이 실려 오는 설정도 있어 하한을 겁니다.
+  const double pos_std = std::max(
+    manual_seed_min_pos_std_,
+    std::sqrt(std::max(0.0, 0.5 * (msg->pose.covariance[0] + msg->pose.covariance[7]))));
+  const double yaw_std = std::max(
+    manual_seed_min_yaw_std_,
+    std::sqrt(std::max(0.0, msg->pose.covariance[35])));
+
+  // 이미 떠 있는 전역 탐색의 결과는 버립니다. 남겨 두면 (a) 나중에 도착해
+  // 사람이 찍은 pose 를 덮어쓰거나, (b) 수동 시드로 Lost 를 빠져나간 뒤
+  // 수확되지 않은 채 남았다가 다음 Lost 에서 낡은 결과로 시드됩니다.
+  if (reloc_in_flight_) {
+    reloc_discard_result_ = true;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "manual seed: discarding the in-flight global search result");
+  }
+
+  std::vector<ParticleFilter::ModeSeed> seeds;
+  seeds.push_back(ParticleFilter::ModeSeed{x, y, yaw, 1.0});
+  seedFilter(seeds, pos_std, yaw_std);
+
+  // 파티클을 막 퍼뜨린 직후는 정의상 아직 수렴 전이므로 Converging 으로
+  // 들어갑니다. 주행하며 스캔이 가설을 걸러내면 기존 수렴 판정이 Tracking
+  // 으로 올리고, 그 사이의 신뢰도는 실제 스캔 정합으로 산정돼 나갑니다.
+  const auto previous = state_;
+  setState(LocalizationState::Converging);
+  manual_seed_stamp_ = this->now().seconds();
+  reloc_last_empty_ = false;
+
+  const char *from =
+    previous == LocalizationState::Lost ? "Lost" :
+    previous == LocalizationState::Converging ? "Converging" :
+    previous == LocalizationState::Tracking ? "Tracking" : "WaitingForMap";
+  RCLCPP_INFO(
+    this->get_logger(),
+    "manual seed from RViz: (%.2f, %.2f, %.1f deg) spread %.2f m / %.1f deg "
+    "| was %s | global search held for %.1f s",
+    x, y, yaw * 180.0 / kPi, pos_std, yaw_std * 180.0 / kPi,
+    from, manual_seed_grace_s_);
+  announceReloc("MANUAL: RViz 2D Pose Estimate", 0.30f, 0.60f, 0.95f);
+}
+
 void mainNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
   // 레이턴시 계측: 스캔 stamp -> 콜백 진입(전송+큐 지연), 진입 -> 사이클
   // 완료(처리 시간). steady_clock으로 처리 시간을, ROS clock으로 도착
@@ -891,6 +982,20 @@ void mainNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
     // 관측이 신뢰할 만해질 때까지 탐색 자체를 멈춘다. 이게 없으면 반쯤
     // 눈먼 스캔으로 13만 후보를 훑어 앨리어스에 시드하고, 게이트는 그
     // 스캔만 보므로 막지 못한다.
+    // 수동 시드 유예: 사람이 찍은 자리에서 필터가 수렴할 시간을 줍니다.
+    // 유예가 끝나면 평소대로 자동 복구가 돌아오므로, 잘못 찍었더라도
+    // 영구히 갇히지 않습니다.
+    if (manual_seed_stamp_ >= 0.0) {
+      const double since_manual = now.seconds() - manual_seed_stamp_;
+      if (since_manual < manual_seed_grace_s_) {
+        RCLCPP_INFO_THROTTLE(
+          this->get_logger(), *this->get_clock(), 2000,
+          "global search held: manual seed grace (%.1f s left)",
+          manual_seed_grace_s_ - since_manual);
+        return;
+      }
+      manual_seed_stamp_ = -1.0;
+    }
     std::string block_reason;
     if (!searchPreconditionsMet(*msg, block_reason)) {
       RCLCPP_INFO_THROTTLE(
@@ -958,6 +1063,23 @@ bool mainNode::harvestRelocalization() {
   }
   if (reloc_future_.wait_for(std::chrono::seconds(0)) !=
       std::future_status::ready) {
+    return false;
+  }
+
+  if (reloc_discard_result_) {
+    // 수동 시드가 이 탐색을 무효화했습니다. future 는 반드시 소비해서
+    // 다음 Lost 가 낡은 결과를 수확하지 않게 합니다.
+    try {
+      reloc_future_.get();
+    } catch (const std::exception &) {
+      // 버릴 결과이므로 예외도 삼킵니다.
+    }
+    reloc_in_flight_ = false;
+    reloc_discard_result_ = false;
+    reloc_last_empty_ = false;
+    RCLCPP_INFO(
+      this->get_logger(),
+      "global search result discarded (superseded by a manual seed)");
     return false;
   }
 
@@ -1238,7 +1360,9 @@ bool mainNode::harvestRelocalization() {
   return true;
 }
 
-void mainNode::seedFilter(const std::vector<ParticleFilter::ModeSeed> &seeds) {
+void mainNode::seedFilter(
+  const std::vector<ParticleFilter::ModeSeed> &seeds,
+  double position_std, double yaw_std) {
   // 정전 구간을 통과한 DR 오차: 예측(마지막 정상 pose + 그동안의 DR) 대비
   // 실제 시드 위치. 로컬 복구 반경을 이 실측으로 정한다.
   if (lost_anchor_valid_ && !seeds.empty()) {
@@ -1270,7 +1394,14 @@ void mainNode::seedFilter(const std::vector<ParticleFilter::ModeSeed> &seeds) {
     }
     lost_anchor_valid_ = false;
   }
-  filter_.initializeMultiple(seeds);
+  if (seeds.size() == 1 && position_std > 0.0 && yaw_std > 0.0) {
+    // 수동 시드 경로: 호출자가 지정한 퍼짐으로 뿌립니다.
+    filter_.initializeAround(
+      seeds.front().x, seeds.front().y, seeds.front().yaw,
+      position_std, yaw_std);
+  } else {
+    filter_.initializeMultiple(seeds);
+  }
   // 파티클을 다시 뿌렸으므로 오래된 기준 pose와의 큰 차이를 적용하지 않도록
   // propagation 기준을 반드시 초기화합니다.
   propagation_->resetPropagationReference();

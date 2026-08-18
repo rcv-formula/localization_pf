@@ -131,6 +131,49 @@ map_loader:
 외부 `map_server`를 쓰려면 `map_loader.enabled: false`로 두면 `map_topic`을
 구독합니다.
 
+## Manual pose input (RViz "2D Pose Estimate")
+
+Publishing a pose on `/initialpose` (the topic RViz's **2D Pose Estimate**
+tool uses) seeds the filter at that pose. This does **not** replace global
+relocalization — automatic recovery stays fully active. It is a second
+entrance, for when a human already knows where the car is.
+
+Set RViz's **Fixed Frame to `map`**. A pose stamped in any other frame is
+rejected with an error, because its coordinates would mean something else
+entirely.
+
+Behaviour:
+
+- **Accepted in any state, `Tracking` included.** The point of the tool is
+  to be able to pull the filter out of a confident-but-wrong convergence.
+- **The spread comes from the covariance RViz publishes**, floored by
+  `manual_seed_min_pos_std` / `manual_seed_min_yaw_std`. With RViz's default
+  tool settings that is 0.50 m / 15°. The filter's own `init_*_std`
+  (10 cm / 2.9°) is deliberately not reused: that spread is sized for a
+  *verified* global-search seed, and a human click is off by far more, so
+  the particles would be nailed to a wrong pose with no room to converge.
+  The floor exists because some RViz setups publish a zero covariance.
+- **The node enters `Converging`, not `Tracking`.** Particles that were just
+  scattered are by definition not converged yet. The normal convergence test
+  promotes to `Tracking` once they agree, and the confidence published in
+  between is the honest scan-match score of the seeded pose.
+- **Global search is held for `manual_seed_grace_s` (default 5 s)** so the
+  filter can settle where you pointed. After the grace expires automatic
+  recovery behaves normally, so a bad click is not a trap — the node will
+  relocalize itself out of it.
+- **An in-flight global search is discarded.** Otherwise its result would
+  either overwrite your pose on arrival, or survive unharvested and seed the
+  filter from stale data at the next `Lost`.
+
+```bash
+# 예: 명령줄에서 (RViz 없이) 수동 시드
+ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped \
+  "{header: {frame_id: map},
+    pose: {pose: {position: {x: 1.5, y: 2.0}, orientation: {w: 1.0}},
+           covariance: [0.25,0,0,0,0,0, 0,0.25,0,0,0,0, 0,0,0,0,0,0,
+                        0,0,0,0,0,0, 0,0,0,0,0,0, 0,0,0,0,0,0.0685]}}"
+```
+
 ## 인터페이스
 
 **구독 (Subscriptions)**
@@ -141,6 +184,7 @@ map_loader:
 | `/scan` | `sensor_msgs/LaserScan` | best-effort |
 | `/imu` | `sensor_msgs/Imu` | best-effort |
 | `/sensors/core` | `vesc_msgs/VescStateStamped` | 휠 odometry. 기본은 `state.speed`(ERPM)를 `vesc_to_odom`과 동일한 식으로 속도 변환 후 적분 (`ekf.speed_to_erpm_gain`). `ekf.wheel_use_displacement: true`로 두면 `state.displacement`(타코미터) 경로 |
+| `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | RViz "2D Pose Estimate". Manual seeding — see below |
 | `/tf`, `/tf_static` | — | `base_link → laser` extrinsic 조회 |
 
 (토픽 이름은 `config.yaml`에서 변경 가능)

@@ -69,6 +69,11 @@ private:
   // 패키지 map 폴더의 <map_name>.yaml + 이미지를 OccupancyGrid로 읽어
   // setupMap을 호출하고, transient_local로 map_topic에 latch 발행합니다.
   bool loadMapFromFile(const std::string &map_dir, const std::string &map_name);
+  // RViz "2D Pose Estimate"(기본 /initialpose)로 사람이 찍은 pose입니다.
+  // 전역 탐색을 대체하는 것이 아니라, 사람이 아는 위치를 직접 넣는
+  // 별도 입구입니다. 어떤 상태에서든 받습니다.
+  void initialpose_callback(
+    const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
   void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
   void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
   void vesc_state_callback(const vesc_msgs::msg::VescStateStamped::SharedPtr msg);
@@ -130,7 +135,12 @@ private:
   // reloc 트리거 사유를 맵 중앙 텍스트 마커로 알립니다(사유별 색상).
   void announceReloc(const std::string &reason, float r, float g, float b);
   // 가설 목록으로 필터를 재초기화하는 공통 경로입니다(초기화/재수렴 공용).
-  void seedFilter(const std::vector<ParticleFilter::ModeSeed> &seeds);
+  // position_std/yaw_std 가 양수이고 시드가 1개면 그 퍼짐으로 뿌립니다
+  // (수동 시드용 — 사람 클릭의 불확실성은 검증된 리로컬 시드보다 훨씬 큽니다).
+  // 음수면 필터 기본값(filter.init_*_std)을 씁니다.
+  void seedFilter(
+    const std::vector<ParticleFilter::ModeSeed> &seeds,
+    double position_std = -1.0, double yaw_std = -1.0);
   // 이동/회전 간격을 만족할 때 스캔을 히스토리에 남깁니다(모든 상태 공용).
   void updateScanHistory(const sensor_msgs::msg::LaserScan &scan);
   // 히스토리가 있으면 multi-scan, 없으면 단일 스캔 전역 탐색을 돌립니다.
@@ -178,6 +188,19 @@ private:
   // 장면이 이만큼 바뀌면(평균 사거리 변화[m]) 주기를 무시하고 즉시 시도.
   double reloc_scan_change_m_{0.5};
   bool reloc_last_empty_{false};
+  // ---- 수동 시드(RViz 2D Pose Estimate) ----
+  std::string initialpose_topic_{"/initialpose"};
+  // 수동 시드 직후 이 시간 동안은 전역 탐색을 돌리지 않습니다. 사람이 찍은
+  // 자리에서 필터가 수렴할 시간을 주기 위한 것이고, 유예가 끝나면 평소대로
+  // 자동 복구가 동작합니다(잘못 찍었어도 결국 스스로 빠져나옵니다).
+  double manual_seed_grace_s_{5.0};
+  // RViz가 실어 보내는 covariance의 표준편차 하한. RViz 도구 설정에 따라
+  // 0이 실려 올 수 있는데, 그대로 쓰면 파티클이 한 점에 모여 수렴할 여지가
+  // 사라집니다.
+  double manual_seed_min_pos_std_{0.20};
+  double manual_seed_min_yaw_std_{0.09};
+  // 유예 시작 시각[s]. 음수면 유예 없음.
+  double manual_seed_stamp_{-1.0};
   // ---- 전역 탐색 전제조건 ----
   //
   // 관측이 무의미한 구간에서 탐색을 돌리면 13만 후보 중 "반쯤 눈먼 스캔에
@@ -365,6 +388,11 @@ private:
   rclcpp::Time last_relocalize_attempt_{0, 0, RCL_ROS_TIME};
   std::future<GlobalSearchResult> reloc_future_;
   bool reloc_in_flight_{false};
+  // 수동 시드가 들어오면 이미 떠 있는 탐색의 결과를 버립니다. 안 그러면
+  // 사람이 찍은 pose를 나중에 도착한 탐색 결과가 조용히 덮어씁니다. 더
+  // 나쁜 경우, 수동 시드로 Lost 를 빠져나가면 그 future 가 수확되지 않은
+  // 채 남았다가 다음 Lost 에서 낡은 결과로 시드됩니다.
+  bool reloc_discard_result_{false};
   // 탐색을 시작한 순간의 라이다 DR pose. 탐색이 도는 동안에도 EKF는 계속
   // 전진하므로, 수확 시점에 그만큼의 이동을 가설에 합성해야 시드가 현재
   // 시각과 맞습니다. (동기 구현에서는 executor가 막혀 EKF도 함께 멈췄기
@@ -451,6 +479,9 @@ private:
   // ---- ROS 입출력 ----
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr map_pub_;
+  // RViz "2D Pose Estimate". 사람이 드물게 한 번 쏘는 입력이라 depth 1.
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    initialpose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;
