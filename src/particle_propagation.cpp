@@ -422,6 +422,43 @@ void particlePropagation::resetPropagationReference() {
     has_propagation_reference_ = false;
 }
 
+void particlePropagation::resetDynamicState() {
+    if (!ekf_initialized_) {
+        return;
+    }
+    // initializeEkf와 같은 값으로 되돌리되 pose(kX,kY,kYaw)는 건드리지
+    // 않습니다. 속도는 0으로 두어도 다음 휠 샘플이 수십 ms 안에 복원합니다
+    // (초기 공분산 0.30^2 이 측정을 즉시 지배).
+    const int32_t reset_states[] = {
+        kVelocity, kGyroZBias, kAccelXBias, kAccelYBias,
+        kPitch, kPitchRate, kRoll, kRollRate};
+    for (const int32_t index : reset_states) {
+        ekf_state_(index) = 0.0;
+        // 오염된 상태와 pose 사이의 교차 상관도 더는 유효하지 않습니다.
+        ekf_covariance_.row(index).setZero();
+        ekf_covariance_.col(index).setZero();
+    }
+    // 시동 정지 보정의 자이로 bias는 손으로 움직여도 참값이 변하지 않으므로
+    // 이어받습니다(온라인으로 오염된 추정치를 버리고 보정값으로 복귀).
+    if (gravity_calibration_.valid) {
+        ekf_state_(kGyroZBias) = gravity_calibration_.gyro_z_bias;
+    }
+    ekf_covariance_(kVelocity, kVelocity) = square(0.30);
+    ekf_covariance_(kGyroZBias, kGyroZBias) =
+        ekf_params_.process_gyro_bias_std > 0.0 ? square(0.03) : 0.0;
+    ekf_covariance_(kAccelXBias, kAccelXBias) = square(0.30);
+    ekf_covariance_(kAccelYBias, kAccelYBias) = square(0.30);
+    ekf_covariance_(kPitch, kPitch) = square(0.05);
+    ekf_covariance_(kPitchRate, kPitchRate) = square(0.10);
+    ekf_covariance_(kRoll, kRoll) = square(0.05);
+    ekf_covariance_(kRollRate, kRollRate) = square(0.10);
+    // 샘플 파생 캐시도 함께 비웁니다 — 들고 흔든 마지막 샘플의 각가속/가속이
+    // 다음 예측의 초기값으로 쓰이면 리셋 직후 한 스텝이 또 오염됩니다.
+    last_yaw_rate_ = 0.0;
+    last_yaw_accel_ = 0.0;
+    last_rear_accel_x_ = 0.0;
+}
+
 // 최신 센서 시각으로 전파합니다. 시간 정합이 필요한 경로는 target_time을 주는
 // 오버로드를 사용하세요.
 // 편의 오버로드입니다. writer(advanceTo)를 직접 수행한 뒤 reader에 위임합니다.

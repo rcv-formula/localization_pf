@@ -225,6 +225,14 @@ class particlePropagation{
     // relocalization으로 파티클을 다시 뿌린 직후 호출합니다. 다음 propagation이
     // 오래된 기준 pose와의 큰 차이를 한꺼번에 적용하는 것을 막습니다.
     void resetPropagationReference();
+    // EKF의 '동역학' 상태만 재초기화합니다 — 속도, gyro/accel 바이어스,
+    // 서스펜션 pitch/roll(+rate)와 그 공분산. odom 프레임 pose(x,y,yaw)는
+    // 남깁니다(이력 체인·궤적 버퍼가 절대 odom pose 연속성을 전제).
+    //
+    // 용도: 리로컬 시드 직후. Lost 중 차를 들고 움직이면 휠(0)과 IMU(가속)의
+    // 모순이 바이어스·자세 상태로 흡수되고, 시드는 pose만 고치므로 오염된
+    // 바이어스가 시드 후 지속 드리프트를 만든다(스캔이 계속 잡아끄는 증상).
+    void resetDynamicState();
     const MotionDelta &lastMotionDelta() const { return last_motion_delta_; }
     // 궤적 버퍼 최신 샘플의 시각[s]. 출력 보간이 얼마나 오래된 데이터를
     // 쓰는지(보간 레이턴시) 측정용. 버퍼가 비면 음수.

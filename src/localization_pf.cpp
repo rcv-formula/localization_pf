@@ -1418,6 +1418,10 @@ void mainNode::seedFilter(
   // 파티클을 다시 뿌렸으므로 오래된 기준 pose와의 큰 차이를 적용하지 않도록
   // propagation 기준을 반드시 초기화합니다.
   propagation_->resetPropagationReference();
+  // EKF 동역학 상태(속도·바이어스·서스펜션 자세)도 되돌립니다. Lost 중 차를
+  // 들고 움직인 경우 그 모순이 바이어스로 흡수돼 있어, pose만 고치면 시드
+  // 직후부터 일정한 드리프트가 남습니다(스캔이 계속 잡아끄는 증상).
+  propagation_->resetDynamicState();
   // 융합 기준은 첫 번째(최고 점수) 가설에서 시작합니다.
   estimation_.reset(seeds.front().x, seeds.front().y, seeds.front().yaw);
   accumulated_translation_ = 0.0;
