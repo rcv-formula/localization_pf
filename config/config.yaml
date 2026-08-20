@@ -18,6 +18,9 @@
     # RViz "2D Pose Estimate" 도구가 발행하는 토픽. 사람이 아는 위치를 직접
     # 넣는 입구이며, 전역 relocalization 을 대체하지 않습니다(둘 다 살아 있음).
     initialpose_topic: /initialpose
+    # 전역 레이스라인(map 프레임, 폐곡선, 인덱스 증가 = 주행 방향). 전역 탐색
+    # 후보를 헤딩으로 거르는 데 씁니다. latch(transient_local) 발행을 가정합니다.
+    global_path_topic: /global_path
     vesc_state_topic: /sensors/core
     # 최종 결과(map 기준 base_link pose)를 nav_msgs/Odometry로 내보낼 토픽.
     # 관례상 /odom은 휠 오돔에 쓰이므로 충돌하는 스택에서는 이름을 바꾸세요.
@@ -431,6 +434,25 @@
       # 따라 covariance 가 0 으로 실려 오기도 해서 하한이 필요합니다.
       manual_seed_min_pos_std: 0.20
       manual_seed_min_yaw_std: 0.09
+
+      # --- 헤딩 사전정보(주행 경로 + IMU) ---
+      # 환형 코스는 한 방향으로만 달리므로, 어느 지점이든 "그 자리에서 차가
+      # 향할 헤딩"이 정해집니다. 스캔은 닮은꼴 지점을 구분 못 하지만 이 정보는
+      # 구분합니다 — 경로와 반대로 붙은 후보는 대개 다른 곳의 앨리어스입니다.
+      # 필터는 pool -> shortlist 이전에 걸려 잘못된 헤딩이 상위 슬롯을 잡아먹지
+      # 않게 합니다. 통과 조건은 OR(경로 대역 또는 IMU 대역).
+      heading_prior_enabled: true
+      # 경로 헤딩 대비 허용 오차[deg]. 90이면 "역주행 쪽 절반"을 버립니다.
+      path_heading_max_deg: 90.0
+      # 후보가 경로에서 이만큼 멀면 경로 헤딩을 모른다고 보고 검사를 건너뜁니다
+      # (없는 정보로 게이트하지 않음). 밀려나거나 이탈했을 때 정답을 지키는 장치.
+      # 0 이하면 거리와 무관하게 항상 검사합니다.
+      path_heading_max_distance_m: 3.0
+      # IMU 사전헤딩(Lost 직전 헤딩 + 그 이후 자이로 회전량) 대비 허용 오차[deg].
+      # gap_follow가 차를 돌려놓았다면 경로와 어긋나는 게 정상이므로, 이 대역의
+      # 후보는 경로 검사에서 떨어져도 살립니다. 전복 등 IMU 자세 이벤트가 있었던
+      # 에피소드에서는 prior 자체가 무의미하므로 대역을 열지 않습니다.
+      imu_heading_max_deg: 45.0
       multi_scan_count: 12
       # 이력 '저장' 용량(장). 사용 장수(multi_scan_count-1=11)와 분리 — 저장은
       # 0.1 m 간격으로 조밀하게 하고, 탐색 시 그중 기하적으로 가장 퍼진 11장을

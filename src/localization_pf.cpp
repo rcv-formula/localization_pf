@@ -136,6 +136,10 @@ mainNode::mainNode()
   // 센서 입력은 best-effort로 받습니다. reliable 구독자는 best-effort 퍼블리셔의
   // 메시지를 아예 받지 못하지만(QoS 비호환), best-effort 구독자는 reliable
   // 퍼블리셔의 것도 받습니다. 드라이버/재생기 어느 쪽에도 붙으려면 이쪽입니다.
+  // 전역 경로는 latch로 한 번만 발행되는 경우가 많아 transient_local로 받습니다.
+  global_path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
+    global_path_topic_, rclcpp::QoS(1).transient_local(),
+    std::bind(&mainNode::global_path_callback, this, std::placeholders::_1));
   initialpose_sub_ =
     this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
       initialpose_topic_, 1,
@@ -176,6 +180,8 @@ void mainNode::declareParameters() {
   // RViz "2D Pose Estimate" 입력.
   initialpose_topic_ = this->declare_parameter<std::string>(
     "initialpose_topic", "/initialpose");
+  global_path_topic_ = this->declare_parameter<std::string>(
+    "global_path_topic", "/global_path");
   manual_seed_grace_s_ = std::max(0.0, this->declare_parameter<double>(
     "relocalization.manual_seed_grace_s", 5.0));
   manual_seed_min_pos_std_ = std::max(0.01, this->declare_parameter<double>(
@@ -375,6 +381,17 @@ void mainNode::declareParameters() {
   relocalization_parameters_.history_majority_fraction = std::clamp(
     this->declare_parameter<double>(
       "relocalization.history_majority_fraction", 0.5), 0.0, 1.0);
+  relocalization_parameters_.heading_prior_enabled = this->declare_parameter<bool>(
+    "relocalization.heading_prior_enabled", true);
+  relocalization_parameters_.path_heading_max_deg = std::max(0.0,
+    this->declare_parameter<double>(
+      "relocalization.path_heading_max_deg", 90.0));
+  relocalization_parameters_.path_heading_max_distance_m =
+    this->declare_parameter<double>(
+      "relocalization.path_heading_max_distance_m", 3.0);
+  relocalization_parameters_.imu_heading_max_deg = std::max(0.0,
+    this->declare_parameter<double>(
+      "relocalization.imu_heading_max_deg", 45.0));
   relocalization_parameters_.history_min_support_weight = std::max(0.0,
     this->declare_parameter<double>(
       "relocalization.history_min_support_weight", 2.0));
@@ -853,6 +870,64 @@ void mainNode::vesc_state_callback(const vesc_msgs::msg::VescStateStamped::Share
   propagation_->wheelGetter(*msg);
 }
 
+// 전역 레이스라인을 받아 헤딩 사전정보로 넘깁니다. 환형 경로는 인덱스 증가
+// 방향으로만 주행하므로, 어느 지점에서든 "그 자리에서 차가 향할 헤딩"이
+// 정해집니다 — 스캔이 구분 못 하는 닮은꼴 지점을 이 정보는 구분합니다.
+void mainNode::global_path_callback(const nav_msgs::msg::Path::SharedPtr msg) {
+  if (!relocalization_) {
+    return;
+  }
+  std::string frame = msg->header.frame_id;
+  if (!frame.empty() && frame.front() == '/') {
+    frame.erase(frame.begin());
+  }
+  if (!frame.empty() && frame != map_frame_) {
+    RCLCPP_ERROR(
+      this->get_logger(),
+      "global path ignored: frame '%s' is not the map frame '%s'",
+      msg->header.frame_id.c_str(), map_frame_.c_str());
+    return;
+  }
+  std::vector<std::array<double, 2>> points;
+  points.reserve(msg->poses.size());
+  for (const auto &pose : msg->poses) {
+    points.push_back({pose.pose.position.x, pose.pose.position.y});
+  }
+  if (points.size() < 2) {
+    RCLCPP_WARN(
+      this->get_logger(), "global path ignored: %zu points", points.size());
+    return;
+  }
+  // 같은 경로의 재발행은 무시합니다. 스택에 따라 이 토픽이 40~50 Hz로 계속
+  // 나오는데(예: /Path), 그때마다 워커를 기다리면 탐색이 도는 동안 스캔
+  // 콜백이 초당 수십 번 막힙니다. 점 수 + 시작/중간/끝 좌표로 충분히 갈립니다.
+  const std::size_t mid = points.size() / 2;
+  const std::array<double, 6> signature{
+    static_cast<double>(points.size()),
+    points.front()[0], points.front()[1],
+    points[mid][0], points[mid][1], points.back()[0]};
+  if (global_path_ready_ && signature == global_path_signature_) {
+    return;
+  }
+  global_path_signature_ = signature;
+
+  // 워커가 경로를 읽는 중일 수 있으므로 교체 전에 끝나기를 기다립니다.
+  waitForRelocalizationWorker();
+  relocalization_->setGlobalPath(points);
+  double length = 0.0;
+  for (std::size_t i = 1; i < points.size(); ++i) {
+    length += std::hypot(points[i][0] - points[i - 1][0],
+                         points[i][1] - points[i - 1][1]);
+  }
+  const double closure = std::hypot(
+    points.back()[0] - points.front()[0], points.back()[1] - points.front()[1]);
+  global_path_ready_ = true;
+  RCLCPP_INFO(
+    this->get_logger(),
+    "global path: %zu points, %.1f m, closure %.2f m (%s) — heading prior on",
+    points.size(), length, closure, closure < 0.5 ? "closed" : "open");
+}
+
 // RViz "2D Pose Estimate"로 사람이 직접 위치를 지정하는 입구입니다.
 // 전역 relocalization 을 대체하지 않습니다 — 자동 탐색은 그대로 살아 있고,
 // 이건 "사람이 답을 알고 있을 때 그 답을 넣는" 별도 경로입니다.
@@ -1013,6 +1088,24 @@ void mainNode::scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
       buildGlobalSearchRequest(*msg));
     reloc_anchor_valid_ = currentLaserDrPose(
       reloc_anchor_x_, reloc_anchor_y_, reloc_anchor_yaw_);
+    // IMU 사전헤딩: Lost 직전의 확정 헤딩 + 그 이후 자이로가 적분한 회전량.
+    // 경로 헤딩과 어긋나더라도(gap_follow가 차를 돌려놓은 경우) 이 대역의
+    // 후보는 살려 둡니다. 전복 등으로 자세 이벤트가 있었으면 이 prior 자체가
+    // 무의미하므로 열지 않습니다 — 플립 조항과 같은 판단 기준입니다.
+    {
+      double dr_x = 0.0;
+      double dr_y = 0.0;
+      double dr_yaw = 0.0;
+      const bool usable = lost_anchor_valid_ && !lost_imu_event_ &&
+        currentLaserDrPose(dr_x, dr_y, dr_yaw);
+      if (usable) {
+        relocalization_->setPriorHeading(
+          normalizeAngle(lost_fused_yaw_ + normalizeAngle(dr_yaw - lost_dr_yaw_)),
+          true);
+      } else {
+        relocalization_->setPriorHeading(0.0, false);
+      }
+    }
     reloc_future_ = std::async(
       std::launch::async,
       [this, request]() { return executeGlobalSearch(*request); });
@@ -1113,13 +1206,13 @@ bool mainNode::harvestRelocalization() {
     RCLCPP_INFO(
       this->get_logger(),
       "global search: no hypotheses | best %.3f (RMS %.2f m, gate %.2f m) "
-      "inlier best %.2f (gate %.2f) | pool %zu: score_floor %zu, dup %zu, "
+      "inlier best %.2f (gate %.2f) | heading %zu | pool %zu: score_floor %zu, dup %zu, "
       "verify %zu(inl %zu/see %zu/cov %zu), ok %zu | scans %zu pts %zu"
       " | top: vis %u/%u occl %u inl %.2f see %.2f sect %u visRMS %.2f fail 0x%02x",
       best, best < 0.0 ? std::sqrt(-best) : 0.0,
       relocalization_parameters_.hypothesis_max_rms_m,
       diag.best_inlier, relocalization_parameters_.hypothesis_verify_fraction,
-      diag.pool_size, diag.rejected_score_floor, diag.absorbed_duplicate,
+      diag.rejected_heading, diag.pool_size, diag.rejected_score_floor, diag.absorbed_duplicate,
       diag.rejected_verify, diag.rejected_verify_inlier,
       diag.rejected_verify_seethrough, diag.rejected_verify_coverage,
       diag.accepted,
@@ -1333,9 +1426,9 @@ bool mainNode::harvestRelocalization() {
     }
     RCLCPP_INFO(
       this->get_logger(),
-      "reloc %zu hypotheses, pts=%zu | aggregate old %.4f new %.4f"
+      "reloc %zu hypotheses, pts=%zu | heading rejected %zu | aggregate old %.4f new %.4f"
       " | views RMScm/vis%% [%s]",
-      result.hypotheses.size(), result.scan_points,
+      result.hypotheses.size(), result.scan_points, diag.rejected_heading,
       diag.top_score_old, diag.top_score_new, views.c_str());
   }
 

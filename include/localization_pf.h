@@ -20,6 +20,7 @@
 #include "geometry_msgs/msg/pose_array.hpp"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
@@ -72,6 +73,9 @@ private:
   // RViz "2D Pose Estimate"(기본 /initialpose)로 사람이 찍은 pose입니다.
   // 전역 탐색을 대체하는 것이 아니라, 사람이 아는 위치를 직접 넣는
   // 별도 입구입니다. 어떤 상태에서든 받습니다.
+  // 전역 레이스라인(map 프레임, 폐곡선, 인덱스 증가 = 주행 방향).
+  // 헤딩 사전정보로 전역 탐색 후보를 거르는 데 씁니다.
+  void global_path_callback(const nav_msgs::msg::Path::SharedPtr msg);
   void initialpose_callback(
     const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
   void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg);
@@ -496,6 +500,12 @@ private:
   // RViz "2D Pose Estimate". 사람이 드물게 한 번 쏘는 입력이라 depth 1.
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
     initialpose_sub_;
+  // 전역 경로는 보통 latch(transient_local)로 한 번 발행됩니다.
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr global_path_sub_;
+  std::string global_path_topic_{"/global_path"};
+  bool global_path_ready_{false};
+  // 재발행 감지용 서명(점 수 + 시작/중간/끝 좌표).
+  std::array<double, 6> global_path_signature_{};
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Subscription<vesc_msgs::msg::VescStateStamped>::SharedPtr vesc_state_sub_;

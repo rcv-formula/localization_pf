@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <queue>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -166,6 +167,9 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeMultiple(
     std::vector<PoseCandidate> pool;
     pool.reserve(4096);
     const SearchResult result = searchGlobalPose(view, &pool);
+    // 헤딩 사전정보는 shortlist/정렬 이전에 걸어야 잘못된 헤딩 후보가 상위
+    // 슬롯을 잡아먹지 않는다.
+    applyHeadingPrior(pool);
     diagnostics_.best_score = result.best.score;
     diagnostics_.scan_points = view.size();
     if (!result.valid || pool.empty()) {
@@ -179,6 +183,237 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeMultiple(
             return a.score > b.score;
         });
     return selectHypotheses(pool, result.best.score, &view);
+}
+
+void Relocalization::setGlobalPath(
+    const std::vector<std::array<double, 2>> &points) {
+    path_points_ = points;
+    path_headings_.clear();
+    if (path_points_.size() < 2) {
+        return;
+    }
+    // 폐곡선이면 시작/끝이 사실상 같은 점이므로 중복을 지우고 순환으로 잇는다.
+    const double close = std::hypot(
+        path_points_.back()[0] - path_points_.front()[0],
+        path_points_.back()[1] - path_points_.front()[1]);
+    const bool closed = close < 0.5;
+    if (closed && path_points_.size() > 2) {
+        path_points_.pop_back();
+    }
+    const std::size_t n = path_points_.size();
+    path_headings_.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        // 인덱스 증가 방향이 주행 방향이다. 마지막 점은 폐곡선이면 첫 점으로,
+        // 열린 경로면 직전 구간의 방향을 그대로 쓴다.
+        std::size_t j = i + 1;
+        if (j >= n) {
+            if (closed) {
+                j = 0;
+            } else {
+                path_headings_[i] = path_headings_.empty() || i == 0
+                    ? 0.0 : path_headings_[i - 1];
+                continue;
+            }
+        }
+        path_headings_[i] = std::atan2(
+            path_points_[j][1] - path_points_[i][1],
+            path_points_[j][0] - path_points_[i][0]);
+    }
+    buildPathField();
+}
+
+void Relocalization::buildPathField() {
+    path_owner_.clear();
+    path_distance_.clear();
+    if (!map_ready_ || path_points_.size() < 2 ||
+        path_headings_.size() != path_points_.size()) {
+        return;
+    }
+    const int32_t width = static_cast<int32_t>(processed_map_.width);
+    const int32_t height = static_cast<int32_t>(processed_map_.height);
+    const double resolution = processed_map_.resolution;
+    if (width <= 0 || height <= 0 || resolution <= 0.0) {
+        return;
+    }
+    const std::size_t cells =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const auto &free_map = processed_map_.cell_to_candidate;
+    if (free_map.size() != cells) {
+        return;
+    }
+
+    path_owner_.assign(cells, -1);
+    path_distance_.assign(cells, std::numeric_limits<float>::max());
+
+    // 맵 원점의 회전까지 반영해 map 좌표 -> cell 로 옮긴다.
+    const double cos_yaw = std::cos(-processed_map_.origin_yaw);
+    const double sin_yaw = std::sin(-processed_map_.origin_yaw);
+    const auto to_cell = [&](double wx, double wy, int32_t &cx, int32_t &cy) {
+        const double dx = wx - processed_map_.origin_x;
+        const double dy = wy - processed_map_.origin_y;
+        const double lx = cos_yaw * dx - sin_yaw * dy;
+        const double ly = sin_yaw * dx + cos_yaw * dy;
+        cx = static_cast<int32_t>(std::floor(lx / resolution));
+        cy = static_cast<int32_t>(std::floor(ly / resolution));
+    };
+
+    // 다중 시작점 다익스트라(8-이웃). 경로점이 free가 아니면(벽에 걸침 등)
+    // 가장 가까운 free 이웃으로 밀어 넣는다 — 그러지 않으면 그 구간 전체가
+    // 주인 없는 셀로 남는다.
+    using Node = std::pair<float, int32_t>;   // (거리, 셀 인덱스)
+    std::priority_queue<Node, std::vector<Node>, std::greater<Node>> queue;
+    for (std::size_t i = 0; i < path_points_.size(); ++i) {
+        int32_t cx = 0;
+        int32_t cy = 0;
+        to_cell(path_points_[i][0], path_points_[i][1], cx, cy);
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                const int32_t nx = cx + dx;
+                const int32_t ny = cy + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+                    continue;
+                }
+                const std::size_t index =
+                    static_cast<std::size_t>(ny) * width + static_cast<std::size_t>(nx);
+                if (free_map[index] < 0) {
+                    continue;
+                }
+                const float cost = static_cast<float>(
+                    std::hypot(dx, dy) * resolution);
+                if (cost < path_distance_[index]) {
+                    path_distance_[index] = cost;
+                    path_owner_[index] = static_cast<int32_t>(i);
+                    queue.emplace(cost, static_cast<int32_t>(index));
+                }
+            }
+        }
+    }
+
+    const double diag = std::sqrt(2.0) * resolution;
+    while (!queue.empty()) {
+        const auto [dist, index] = queue.top();
+        queue.pop();
+        if (dist > path_distance_[static_cast<std::size_t>(index)]) {
+            continue;   // 낡은 항목
+        }
+        const int32_t cx = index % width;
+        const int32_t cy = index / width;
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                const int32_t nx = cx + dx;
+                const int32_t ny = cy + dy;
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
+                    continue;
+                }
+                const std::size_t n_index =
+                    static_cast<std::size_t>(ny) * width + static_cast<std::size_t>(nx);
+                if (free_map[n_index] < 0) {
+                    continue;   // free 셀만 통과 — 벽을 뚫지 않는다
+                }
+                const float step = static_cast<float>(
+                    (dx != 0 && dy != 0) ? diag : resolution);
+                const float next = dist + step;
+                if (next < path_distance_[n_index]) {
+                    path_distance_[n_index] = next;
+                    path_owner_[n_index] = path_owner_[static_cast<std::size_t>(index)];
+                    queue.emplace(next, static_cast<int32_t>(n_index));
+                }
+            }
+        }
+    }
+}
+
+bool Relocalization::pathHeadingAt(
+    double x, double y, double &heading, double &distance) const {
+    if (path_points_.size() < 2 || path_headings_.size() != path_points_.size()) {
+        return false;
+    }
+    const int32_t width = static_cast<int32_t>(processed_map_.width);
+    const int32_t height = static_cast<int32_t>(processed_map_.height);
+    const std::size_t cells =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    if (path_owner_.size() != cells || processed_map_.resolution <= 0.0) {
+        return false;
+    }
+    const double cos_yaw = std::cos(-processed_map_.origin_yaw);
+    const double sin_yaw = std::sin(-processed_map_.origin_yaw);
+    const double dx = x - processed_map_.origin_x;
+    const double dy = y - processed_map_.origin_y;
+    const double lx = cos_yaw * dx - sin_yaw * dy;
+    const double ly = sin_yaw * dx + cos_yaw * dy;
+    const int32_t cx =
+        static_cast<int32_t>(std::floor(lx / processed_map_.resolution));
+    const int32_t cy =
+        static_cast<int32_t>(std::floor(ly / processed_map_.resolution));
+    if (cx < 0 || cy < 0 || cx >= width || cy >= height) {
+        return false;
+    }
+    const std::size_t index =
+        static_cast<std::size_t>(cy) * width + static_cast<std::size_t>(cx);
+    const int32_t owner = path_owner_[index];
+    if (owner < 0) {
+        return false;   // free space로 경로에 닿을 수 없는 셀 — 판단 불가
+    }
+    heading = path_headings_[static_cast<std::size_t>(owner)];
+    distance = static_cast<double>(path_distance_[index]);
+    return true;
+}
+
+void Relocalization::applyHeadingPrior(std::vector<PoseCandidate> &pool) {
+    diagnostics_.rejected_heading = 0;
+    if (!parameters_.heading_prior_enabled || pool.empty()) {
+        return;
+    }
+    const bool have_path = path_points_.size() >= 2;
+    if (!have_path && !prior_heading_valid_) {
+        return;  // 사전정보가 하나도 없으면 게이트하지 않는다.
+    }
+    const double path_limit = parameters_.path_heading_max_deg * kPi / 180.0;
+    const double imu_limit = parameters_.imu_heading_max_deg * kPi / 180.0;
+    const double max_distance = parameters_.path_heading_max_distance_m;
+
+    const std::size_t before = pool.size();
+    std::vector<PoseCandidate> kept;
+    kept.reserve(pool.size());
+    for (const PoseCandidate &item : pool) {
+        bool pass = false;
+
+        // (a) 경로 헤딩. 경로를 모르거나 후보가 경로에서 멀면 판단 불가 —
+        //     없는 정보로 후보를 죽이지 않기 위해 통과로 둔다.
+        double path_yaw = 0.0;
+        double path_distance = 0.0;
+        if (have_path && pathHeadingAt(item.x, item.y, path_yaw, path_distance)) {
+            if (max_distance > 0.0 && path_distance > max_distance) {
+                pass = true;  // 경로에서 이탈 — 검사 생략
+            } else if (std::abs(normalizeAngle(item.yaw - path_yaw)) <= path_limit) {
+                pass = true;
+            }
+        } else {
+            pass = true;
+        }
+
+        // (b) IMU 사전헤딩. gap_follow 등으로 차가 실제 돌아간 경우 경로와
+        //     어긋나는 것이 정상이므로 별도 대역으로 함께 인정한다.
+        if (!pass && prior_heading_valid_ &&
+            std::abs(normalizeAngle(item.yaw - prior_heading_)) <= imu_limit) {
+            pass = true;
+        }
+
+        if (pass) {
+            kept.push_back(item);
+        }
+    }
+    // 전멸이면 사전정보가 틀렸을 가능성이 더 크므로 필터를 포기한다.
+    // 후보 0개는 회복 자체를 막지만, 필터를 건너뛰면 기존 게이트들이 판단한다.
+    if (kept.empty()) {
+        diagnostics_.rejected_heading = 0;
+        return;
+    }
+    diagnostics_.rejected_heading = before - kept.size();
+    pool.swap(kept);
 }
 
 Relocalization::VerifyStats Relocalization::computeBeamStats(
@@ -512,6 +747,7 @@ std::vector<Relocalization::Hypothesis> Relocalization::relocalizeMultiple(
     std::vector<PoseCandidate> pool;
     pool.reserve(4096);
     const SearchResult single = searchGlobalPose(latest, &pool);
+    applyHeadingPrior(pool);
     if (!single.valid || pool.empty()) {
         throw std::runtime_error("Relocalization found no valid map candidate.");
     }
@@ -1459,6 +1695,8 @@ void Relocalization::preprocessMap() {
 
     processed_map_.axis_runs.shrink_to_fit();
     map_ready_ = true;
+    // 경로가 먼저 도착했을 수 있다. 필드는 맵과 경로 둘 다 필요하다.
+    buildPathField();
 }
 
 bool Relocalization::isCandidateCell(int32_t cell_x, int32_t cell_y) const {

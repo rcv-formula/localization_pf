@@ -190,6 +190,21 @@ public:
         // 통과율 요구와 증거량 하한.
         double history_majority_fraction{0.5};
         double history_min_support_weight{2.0};
+        // ---- 헤딩 사전정보(주행 경로 + IMU) ----
+        // 환형 레이스라인은 인덱스 증가 방향으로만 주행하므로, 어떤 지점에서든
+        // '그 자리에서 차가 향하고 있을 헤딩'이 정해진다. 스캔만으로는 닮은꼴
+        // 지점을 구분 못 하지만 이 사전정보는 구분한다 — 반대로 붙은 후보는
+        // 대개 다른 곳의 앨리어스다.
+        bool heading_prior_enabled{true};
+        // 경로 헤딩 대비 허용 오차[deg]. 이 이상 틀어지면 후보를 버린다.
+        double path_heading_max_deg{90.0};
+        // 후보가 경로에서 이만큼 멀면 경로 헤딩을 모른다고 보고 검사를 건너뛴다
+        // (없는 정보로 게이트하지 않는다). 0 이하면 거리 무관하게 항상 검사.
+        double path_heading_max_distance_m{3.0};
+        // IMU 사전헤딩 대비 허용 오차[deg]. gap_follow 등으로 차가 실제로
+        // 돌아갔다면 경로와 어긋나는 게 정상이므로, Lost 직전 헤딩에 그동안의
+        // 자이로 회전량을 더한 값도 허용 대역으로 함께 인정한다(OR).
+        double imu_heading_max_deg{45.0};
         // false면 점수는 예전 방식(최신 + 과거 최고 1장)으로 내고 새 집계는
         // 로깅만 한다(섀도 모드).
         bool history_new_aggregate{false};
@@ -258,6 +273,8 @@ public:
         // 가설 선별에서 무엇이 몇 개나 걸렸는지 — "후보가 없다"와 "후보는
         // 있는데 게이트에 걸렸다"를 구분하기 위한 계수입니다.
         std::size_t pool_size{0};
+        // 헤딩 사전정보(경로/IMU)로 pool에서 걸러낸 후보 수.
+        std::size_t rejected_heading{0};
         std::size_t rejected_score_floor{0};
         std::size_t absorbed_duplicate{0};
         std::size_t rejected_verify{0};
@@ -334,6 +351,16 @@ public:
 
     // 직전 relocalize 호출의 탐색 통계입니다.
     const Diagnostics &lastDiagnostics() const { return diagnostics_; }
+
+    // 전역 레이스라인(map 프레임, 인덱스 증가 = 주행 방향). 폐곡선이면 마지막
+    // 점과 첫 점을 이어 헤딩을 계산한다. 빈 벡터를 주면 경로 사전정보를 끈다.
+    void setGlobalPath(const std::vector<std::array<double, 2>> &points);
+    bool hasGlobalPath() const { return path_points_.size() >= 2; }
+    // 이번 탐색에 쓸 IMU 사전헤딩[rad]. valid=false면 IMU 대역을 열지 않는다.
+    void setPriorHeading(double yaw, bool valid) {
+        prior_heading_ = yaw;
+        prior_heading_valid_ = valid;
+    }
 
     // 사전계산 규모를 확인하기 위한 값들입니다(후보 수, run 총 개수).
     std::size_t candidateCount() const { return processed_map_.candidates.size(); }
@@ -510,6 +537,19 @@ private:
     // 모든 시드 후보의 단일 관문 — 표준 채점(latest + 가중 이력) + 게이트.
     // 경로마다 게이트를 중복 구현하면 언젠가 한 곳을 빠뜨리고, 점수 단위가
     // 갈리면 절대 하한과 상대 배율이 잴 것을 잃는다.
+    // 헤딩 사전정보로 후보 pool을 거른다. 통과 조건은 OR:
+    //   (a) 경로 헤딩과 path_heading_max_deg 이내, 또는
+    //   (b) IMU 사전헤딩과 imu_heading_max_deg 이내.
+    // 경로가 없거나 후보가 경로에서 멀면 (a)는 판단 불가로 보고 통과시킨다.
+    void applyHeadingPrior(std::vector<PoseCandidate> &pool);
+    // 경로점들을 시작점으로 free 셀만 통해 다익스트라를 돌려, 각 free 셀의
+    // "도달 가능한 최근접 경로점"과 그 측지 거리를 미리 구한다. 직선거리
+    // 최근접을 쓰면 벽 너머 다른 복도의 경로점이 잡혀 그 헤딩으로 후보를
+    // 판정하게 되는데, 그건 이 후보와 아무 관계가 없는 값이다.
+    void buildPathField();
+    // 후보 위치에서 가장 가까운 경로 구간의 진행 방향[rad]과 그 거리[m].
+    bool pathHeadingAt(double x, double y, double &heading, double &distance) const;
+
     std::vector<Hypothesis> finalizeCandidates(
         std::vector<PoseCandidate> &shortlist,
         const ScanView &latest,
@@ -558,4 +598,12 @@ private:
     bool map_ready_{false};
     // selectHypotheses가 const 경로에서도 계수를 남깁니다.
     mutable Diagnostics diagnostics_;
+    // 전역 경로 점열(map 프레임)과 구간별 사전계산 헤딩.
+    std::vector<std::array<double, 2>> path_points_;
+    std::vector<double> path_headings_;
+    // free 셀별 최근접 경로점 인덱스(-1 = 미도달/비free)와 측지 거리[m].
+    std::vector<int32_t> path_owner_;
+    std::vector<float> path_distance_;
+    double prior_heading_{0.0};
+    bool prior_heading_valid_{false};
 };
